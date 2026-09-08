@@ -82,7 +82,11 @@ function servirEstatico(res, urlPath) {
 
 async function manejar(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  let ruta = url.pathname;
+  // En plataformas sin servidor (Vercel) la petición llega reescrita a una sola
+  // función, así que la ruta original viaja en __ruta. En un servidor propio no
+  // existe ese parámetro y se usa la ruta tal cual.
+  let ruta = url.searchParams.get('__ruta') || url.pathname;
+  url.searchParams.delete('__ruta');
   if (BASE_PATH && ruta.startsWith(BASE_PATH)) ruta = ruta.slice(BASE_PATH.length) || '/';
   // Si el hosting entrega la ruta completa (ej. /facturacion/api/...), la normalizamos
   const posApi = ruta.indexOf('/api/');
