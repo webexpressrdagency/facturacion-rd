@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "public/**",
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
+  ],
+  "env": {
+    "DB_PATH": "/tmp/facturacion.db",
+    "DEMO": "1",
+    "SESSION_SECRET": "demo-publica-no-usar-en-produccion-8f42c1a9"
+  }
+}

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sistema de Facturación y Recibos</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧾</text></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ------------------------------------------------------ login -->
+<div id="login">
+  <form class="caja" id="formLogin">
+    <div class="marca">🧾 Facturación y Recibos</div>
+    <p>Ingrese sus credenciales para continuar</p>
+    <div style="margin-bottom:.75rem"><label>Usuario</label><input name="usuario" value="admin" autocomplete="username" required></div>
+    <div style="margin-bottom:1rem"><label>Contraseña</label><input name="password" type="password" value="" autocomplete="current-password" required></div>
+    <button class="btn-primario" style="width:100%;justify-content:center" type="submit">Entrar</button>
+    <p style="margin:.9rem 0 0;font-size:.8rem">Acceso inicial: <b>admin</b> / <b>admin123</b></p>
+  </form>
+</div>
+
+<!-- ------------------------------------------------------ app -->
+<div id="app">
+  <aside>
+    <div class="logo"><img id="logoLat" alt="" hidden><span id="nombreLat">Mi Empresa</span></div>
+    <nav>
+      <div class="grupo">Gestión</div>
+      <a data-vista="panel">📊 Panel</a>
+      <a data-vista="facturas">🧾 Facturas</a>
+      <a data-vista="presupuestos">📄 Presupuestos</a>
+      <a data-vista="recibos">💵 Ingresos y recibos</a>
+      <a data-vista="gastos">📉 Gastos</a>
+      <div class="grupo">Administración</div>
+      <a data-vista="clientes">👥 Clientes</a>
+      <a data-vista="proveedores">🚚 Proveedores</a>
+      <a data-vista="productos">📦 Productos y servicios</a>
+      <a data-vista="inventario">🏷️ Inventario</a>
+      <a data-vista="reportes">📈 Reportes</a>
+      <a data-vista="config">⚙️ Configuración</a>
+    </nav>
+    <div class="pie">
+      <div id="usuarioLat">—</div>
+      <a id="salir" style="color:#8fa0c4;cursor:pointer">Cerrar sesión</a>
+    </div>
+  </aside>
+  <main id="vista"></main>
+</div>
+
+<div id="aviso"></div>
+<div id="impresion"></div>
+
+<dialog id="modal">
+  <form method="dialog" id="modalForm">
+    <div class="cab"><h2 id="modalTitulo">—</h2><button class="cerrar" type="button" data-cerrar>&times;</button></div>
+    <div class="cuerpo" id="modalCuerpo"></div>
+    <div class="pie" id="modalPie"></div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

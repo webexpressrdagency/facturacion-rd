@@ -1,0 +1,225 @@
+'use strict';
+/* Pruebas automáticas de la API. Uso:  node server.js   y en otra consola:  node pruebas.js */
+const BASE = process.env.BASE || 'http://127.0.0.1:3000';
+let cookie = '';
+let ok = 0, fallos = 0;
+
+async function req(metodo, ruta, body) {
+  const res = await fetch(BASE + ruta, {
+    method: metodo,
+    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const sc = res.headers.get('set-cookie');
+  if (sc) cookie = sc.split(';')[0];
+  const ct = res.headers.get('content-type') || '';
+  const data = ct.includes('json') ? await res.json() : await res.text();
+  return { status: res.status, data };
+}
+
+function check(nombre, cond, extra = '') {
+  if (cond) { ok++; console.log('  ✓', nombre); }
+  else { fallos++; console.log('  ✗', nombre, extra); }
+}
+
+(async () => {
+  console.log('\n== Autenticación ==');
+  check('rechaza sin sesión', (await req('GET', '/api/empresa')).status === 401);
+  check('rechaza contraseña mala', (await req('POST', '/api/auth/login', { usuario: 'admin', password: 'xx' })).status === 401);
+  const login = await req('POST', '/api/auth/login', { usuario: 'admin', password: 'admin123' });
+  check('login correcto', login.status === 200 && login.data.usuario === 'admin');
+  check('sesión activa', (await req('GET', '/api/auth/me')).status === 200);
+
+  console.log('\n== Configuración ==');
+  const emp = await req('PUT', '/api/empresa', {
+    nombre: 'Constructora Prueba SRL', rnc: '131234567', direccion: 'Av. Principal 10, Santo Domingo',
+    telefono: '809-555-0000', email: 'info@prueba.do', moneda: 'DOP', simbolo: 'RD$', itbis_tasa: 18,
+    condiciones: 'Pago a 30 días.', validez_presupuesto: 15,
+  });
+  check('guarda empresa', emp.data.nombre === 'Constructora Prueba SRL' && emp.data.itbis_tasa === 18);
+
+  console.log('\n== Maestros ==');
+  const cli = (await req('POST', '/api/contactos', { tipo: 'cliente', nombre: 'Cliente Uno SRL', rnc: '101000001', telefono: '809-111-1111' })).data;
+  const prov = (await req('POST', '/api/contactos', { tipo: 'proveedor', nombre: 'Ferretería Nacional', rnc: '102000002' })).data;
+  check('crea cliente', cli.id > 0);
+  check('crea proveedor', prov.id > 0);
+  check('rechaza contacto sin nombre', (await req('POST', '/api/contactos', { nombre: '' })).status === 400);
+  const prod = (await req('POST', '/api/productos', { codigo: 'SV-01', nombre: 'Metro de pared', precio: 1500, costo: 900, itbis: 1 })).data;
+  check('crea producto', prod.precio === 1500);
+  check('filtra clientes', (await req('GET', '/api/contactos?tipo=cliente')).data.every((c) => c.tipo === 'cliente'));
+
+  console.log('\n== Facturación e ITBIS ==');
+  const f1 = (await req('POST', '/api/documentos', {
+    tipo: 'factura', contacto_id: cli.id, fecha: '2026-09-01', ncf_tipo: 'B01', estado: 'emitida',
+    items: [
+      { descripcion: 'Metro de pared', cantidad: 10, precio: 1500, descuento: 0, itbis: 1 },
+      { descripcion: 'Servicio exento', cantidad: 1, precio: 1000, descuento: 0, itbis: 0 },
+    ],
+  })).data;
+  check('subtotal correcto', f1.subtotal === 16000, `= ${f1.subtotal}`);
+  check('ITBIS solo sobre líneas gravadas (18% de 15000 = 2700)', f1.itbis === 2700, `= ${f1.itbis}`);
+  check('total correcto', f1.total === 18700, `= ${f1.total}`);
+  check('asigna NCF B01', /^B01\d{8}$/.test(f1.ncf), f1.ncf);
+  check('numera la factura', /^FAC-\d{4}-\d{5}$/.test(f1.numero), f1.numero);
+  check('vencimiento a 30 días', f1.vencimiento === '2026-10-01', f1.vencimiento);
+
+  const f2 = (await req('POST', '/api/documentos', {
+    tipo: 'factura', contacto_id: cli.id, ncf_tipo: 'B02', estado: 'emitida', descuento: 1000,
+    items: [{ descripcion: 'Trabajo', cantidad: 1, precio: 10000, descuento: 10, itbis: 1 }],
+  })).data;
+  check('descuento de línea (10% de 10000)', f2.subtotal === 9000, `= ${f2.subtotal}`);
+  check('ITBIS con descuento global (18% de 8000 = 1440)', f2.itbis === 1440, `= ${f2.itbis}`);
+  check('total con descuento global', f2.total === 9440, `= ${f2.total}`);
+  check('NCF distinto por serie', f2.ncf.startsWith('B02'), f2.ncf);
+  check('NCF consecutivos únicos', f1.ncf !== f2.ncf);
+  check('rechaza documento sin líneas', (await req('POST', '/api/documentos', { tipo: 'factura', contacto_id: cli.id, items: [] })).status === 400);
+
+  console.log('\n== Cobros y recibos ==');
+  const pago1 = (await req('POST', '/api/ingresos', { documento_id: f1.id, monto: 8700, metodo: 'Transferencia' })).data;
+  check('emite recibo numerado', /^REC-\d{4}-\d{5}$/.test(pago1.recibo), pago1.recibo);
+  let f1b = (await req('GET', '/api/documentos/' + f1.id)).data;
+  check('balance tras pago parcial', f1b.balance === 10000, `= ${f1b.balance}`);
+  check('estado pasa a parcial', f1b.estado === 'parcial', f1b.estado);
+  check('rechaza pago mayor al balance', (await req('POST', '/api/ingresos', { documento_id: f1.id, monto: 99999 })).status === 400);
+  await req('POST', '/api/ingresos', { documento_id: f1.id, monto: 10000, metodo: 'Efectivo' });
+  f1b = (await req('GET', '/api/documentos/' + f1.id)).data;
+  check('estado pasa a pagada', f1b.estado === 'pagada', f1b.estado);
+  check('balance en cero', Math.abs(f1b.balance) < 0.01, `= ${f1b.balance}`);
+  check('la factura no se puede borrar con pagos', (await req('DELETE', '/api/documentos/' + f1.id)).status === 400);
+
+  console.log('\n== Presupuestos ==');
+  const p1 = (await req('POST', '/api/documentos', {
+    tipo: 'presupuesto', contacto_id: cli.id, estado: 'enviado',
+    items: [{ descripcion: 'Remodelación', cantidad: 1, precio: 50000, descuento: 0, itbis: 1 }],
+  })).data;
+  check('numera el presupuesto', /^PRE-\d{4}-\d{5}$/.test(p1.numero), p1.numero);
+  check('presupuesto sin NCF', !p1.ncf);
+  const conv = (await req('POST', `/api/documentos/${p1.id}/facturar`, { ncf_tipo: 'B01' })).data;
+  check('convierte presupuesto en factura', conv.tipo === 'factura' && conv.total === p1.total, `${conv.total} vs ${p1.total}`);
+  check('la factura conserva las líneas', conv.items.length === p1.items.length);
+  const p1b = (await req('GET', '/api/documentos/' + p1.id)).data;
+  check('presupuesto queda facturado', p1b.estado === 'facturado', p1b.estado);
+
+  console.log('\n== Gastos ==');
+  const g1 = (await req('POST', '/api/gastos', {
+    concepto: 'Compra de cemento', categoria: 'Materiales', contacto_id: prov.id,
+    subtotal: 20000, itbis: 3600, fecha: '2026-09-02', ncf: 'B0100000123', deducible: 1,
+  })).data;
+  check('calcula total del gasto', g1.monto === 23600, `= ${g1.monto}`);
+  await req('POST', '/api/gastos', { concepto: 'Combustible', categoria: 'Combustible', subtotal: 5000, itbis: 900, fecha: '2026-09-02' });
+  check('lista gastos filtrados', (await req('GET', '/api/gastos?categoria=Materiales')).data.length === 1);
+
+  console.log('\n== Reportes ==');
+  const r = (await req('GET', '/api/reportes/resumen?desde=2026-01-01&hasta=2026-12-31')).data;
+  check('suma ingresos', r.ingresos === 18700, `= ${r.ingresos}`);
+  check('suma gastos', r.gastos === 29500, `= ${r.gastos}`);
+  check('calcula utilidad', r.balance === -10800, `= ${r.balance}`);
+  check('ITBIS de compras deducible', r.itbisCompras === 4500, `= ${r.itbisCompras}`);
+  check('serie de 12 meses', r.serie.length === 12);
+  const cxc = (await req('GET', '/api/reportes/cuentas-por-cobrar')).data;
+  check('cuentas por cobrar excluye pagadas', !cxc.some((x) => x.id === f1.id));
+  const est = (await req('GET', '/api/reportes/estado?desde=2026-01-01&hasta=2026-12-31')).data;
+  check('estado de resultados cuadra', est.utilidad === est.totalIngresos - est.totalGastos);
+  const itb = (await req('GET', '/api/reportes/itbis?desde=2026-01-01&hasta=2026-12-31')).data;
+  check('reporte ITBIS por mes', Array.isArray(itb) && itb.length > 0);
+
+  console.log('\n== Inventario ==');
+  const art = (await req('POST', '/api/productos', {
+    codigo: 'CEM-01', nombre: 'Funda de cemento', unidad: 'funda', precio: 480, costo: 380,
+    itbis: 1, inventario: 1, existencia: 100, minimo: 20,
+  })).data;
+  check('crea artículo con existencia inicial', art.inventario === 1 && art.existencia === 100, `= ${art.existencia}`);
+  const servicio = (await req('POST', '/api/productos', { nombre: 'Mano de obra', precio: 2000, inventario: 0 })).data;
+  check('un servicio no lleva existencias', servicio.inventario === 0);
+
+  const fInv = (await req('POST', '/api/documentos', {
+    tipo: 'factura', contacto_id: cli.id, estado: 'emitida', ncf_tipo: 'B02',
+    items: [
+      { descripcion: 'Funda de cemento', producto_id: art.id, cantidad: 30, precio: 480, itbis: 1 },
+      { descripcion: 'Mano de obra', producto_id: servicio.id, cantidad: 1, precio: 2000, itbis: 1 },
+    ],
+  })).data;
+  let artB = (await req('GET', '/api/inventario')).data.filas.find((x) => x.id === art.id);
+  check('facturar descuenta la existencia', artB.existencia === 70, `= ${artB.existencia}`);
+  check('no avisa si hay existencia suficiente', (fInv.avisosStock || []).length === 0);
+
+  await req('POST', '/api/documentos/' + fInv.id + '/estado', { estado: 'anulada' });
+  artB = (await req('GET', '/api/inventario')).data.filas.find((x) => x.id === art.id);
+  check('anular la factura devuelve la existencia', artB.existencia === 100, `= ${artB.existencia}`);
+
+  const fFalta = (await req('POST', '/api/documentos', {
+    tipo: 'factura', contacto_id: cli.id, estado: 'emitida',
+    items: [{ descripcion: 'Funda de cemento', producto_id: art.id, cantidad: 150, precio: 480, itbis: 1 }],
+  })).data;
+  check('permite vender sin existencia pero avisa', fFalta.avisosStock.length === 1, JSON.stringify(fFalta.avisosStock));
+  artB = (await req('GET', '/api/inventario')).data.filas.find((x) => x.id === art.id);
+  check('la existencia queda en negativo', artB.existencia === -50, `= ${artB.existencia}`);
+
+  await req('POST', '/api/inventario/movimiento', { producto_id: art.id, tipo: 'entrada', cantidad: 200, costo: 400, motivo: 'Compra' });
+  artB = (await req('GET', '/api/inventario')).data.filas.find((x) => x.id === art.id);
+  check('la entrada suma a la existencia', artB.existencia === 150, `= ${artB.existencia}`);
+  check('la entrada actualiza el costo', artB.costo === 400, `= ${artB.costo}`);
+
+  await req('POST', '/api/inventario/movimiento', { producto_id: art.id, tipo: 'ajuste', cantidad: 148, motivo: 'Conteo físico' });
+  artB = (await req('GET', '/api/inventario')).data.filas.find((x) => x.id === art.id);
+  check('el ajuste fija la existencia contada', artB.existencia === 148, `= ${artB.existencia}`);
+
+  const kardex = (await req('GET', `/api/inventario/${art.id}/movimientos`)).data;
+  check('el kardex registra cada movimiento', kardex.movimientos.length >= 5, `= ${kardex.movimientos.length}`);
+  check('el kardex enlaza la factura', kardex.movimientos.some((m) => m.factura));
+  check('rechaza movimientos sobre un servicio',
+    (await req('POST', '/api/inventario/movimiento', { producto_id: servicio.id, tipo: 'entrada', cantidad: 5 })).status === 400);
+
+  await req('PUT', '/api/productos/' + art.id, { ...artB, nombre: 'Funda de cemento', inventario: 1, minimo: 200, activo: 1, itbis: 1 });
+  const resInv = (await req('GET', '/api/reportes/resumen')).data;
+  check('el panel alerta de artículos bajo el mínimo', resInv.bajoMinimo.some((x) => x.id === art.id));
+  check('el panel calcula el valor del inventario', resInv.inventarioValor > 0, `= ${resInv.inventarioValor}`);
+
+  console.log('\n== PDF, enlace público y WhatsApp ==');
+  const pdf = await req('GET', `/api/documentos/${f1.id}/pdf`);
+  check('genera el PDF de la factura', typeof pdf.data === 'string' && pdf.data.startsWith('%PDF-'));
+  const pdfRec = await req('GET', '/api/ingresos/1/pdf');
+  check('genera el PDF del recibo', typeof pdfRec.data === 'string' && pdfRec.data.startsWith('%PDF-'));
+
+  const comp = (await req('GET', `/api/documentos/${f1.id}/compartir`)).data;
+  check('crea el enlace público', /\/p\/[0-9a-f]{32}$/.test(comp.enlace), comp.enlace);
+  check('arma el mensaje de WhatsApp', comp.whatsapp.startsWith('https://wa.me/') && comp.whatsapp.includes('text='));
+  check('normaliza el teléfono dominicano', comp.numero === '18091111111', comp.numero);
+
+  const guardada = cookie; cookie = '';
+  const publica = await req('GET', `/p/${comp.token}`);
+  check('el enlace público abre sin sesión', publica.status === 200 && String(publica.data).includes(f1.numero));
+  const pdfPublico = await req('GET', `/p/${comp.token}/pdf`);
+  check('el PDF público descarga sin sesión', String(pdfPublico.data).startsWith('%PDF-'));
+  check('un token inventado no abre nada', (await req('GET', '/p/0000000000000000')).status === 404);
+  cookie = guardada;
+
+  await req('DELETE', `/api/documentos/${f1.id}/compartir`);
+  cookie = '';
+  check('el enlace revocado deja de funcionar', (await req('GET', `/p/${comp.token}`)).status === 404);
+  cookie = guardada;
+
+  console.log('\n== Correo ==');
+  const cor = (await req('PUT', '/api/correo', {
+    activo: 1, servidor: '127.0.0.1', puerto: 2525, seguridad: 'starttls',
+    usuario: 'pruebas@ejemplo.do', clave: 'secreta', remitente: 'pruebas@ejemplo.do', nombre_remitente: 'Pruebas',
+  })).data;
+  check('guarda la configuración de correo', cor.servidor === '127.0.0.1' && cor.tiene_clave === 1);
+  check('nunca devuelve la contraseña', cor.clave === '');
+  const cor2 = (await req('PUT', '/api/correo', { ...cor, clave: '' })).data;
+  check('conserva la contraseña si se deja vacía', cor2.tiene_clave === 1);
+  const sinDestino = await req('POST', `/api/documentos/${f2.id}/correo`, { para: '' });
+  check('exige destinatario', sinDestino.status === 400 && /destinatario/i.test(sinDestino.data.error), JSON.stringify(sinDestino.data));
+
+  console.log('\n== Exportación y seguridad ==');
+  const csv = await req('GET', '/api/export/facturas');
+  check('exporta CSV de facturas', typeof csv.data === 'string' && csv.data.includes('numero'));
+  check('ruta inexistente devuelve 404', (await req('GET', '/api/nada')).status === 404);
+  const cookieBuena = cookie; cookie = 'sid=falso';
+  check('rechaza cookie inválida', (await req('GET', '/api/empresa')).status === 401);
+  cookie = cookieBuena;
+  check('logout cierra sesión', (await req('POST', '/api/auth/logout')).status === 200);
+
+  console.log(`\n${fallos === 0 ? '✅' : '❌'}  ${ok} pruebas correctas, ${fallos} fallidas\n`);
+  process.exit(fallos ? 1 : 0);
+})();

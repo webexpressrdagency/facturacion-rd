@@ -1,0 +1,14 @@
+{
+  "name": "facturacion-rd",
+  "version": "1.1.0",
+  "description": "Sistema de facturación, presupuestos, recibos, inventario y control de ingresos y gastos (República Dominicana — ITBIS/NCF). Sin dependencias externas.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "prueba": "node pruebas.js"
+  },
+  "engines": { "node": "22.x" },
+  "keywords": ["facturacion", "ncf", "itbis", "republica-dominicana", "inventario", "recibos"],
+  "private": true,
+  "license": "MIT"
+}
