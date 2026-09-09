@@ -11,7 +11,26 @@ const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
 const hoy = () => new Date().toISOString().slice(0, 10);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const n2 = (v) => (Math.round((Number(v) || 0) * 100) / 100);
-const money = (v) => `${S.empresa?.simbolo || 'RD$'} ${n2(v).toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const SIMBOLOS = { DOP: 'RD$', USD: 'US$' };
+/* Cada importe se muestra con su propia moneda; si no se indica, con la
+   predeterminada de la empresa. Nunca se convierte entre monedas. */
+const simbolo = (mon) => SIMBOLOS[mon] || S.empresa?.simbolo || 'RD$';
+const money = (v, mon) => `${simbolo(mon || S.empresa?.moneda)} ${n2(v).toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/** Suma una lista agrupando por moneda y la devuelve ya formateada. */
+function totalPorMoneda(filas, campo = 'monto') {
+  const acc = {};
+  for (const f of filas) acc[f.moneda || 'DOP'] = (acc[f.moneda || 'DOP'] || 0) + (Number(f[campo]) || 0);
+  const partes = Object.entries(acc).filter(([, v]) => Math.abs(v) > 0.009)
+    .map(([m, v]) => `<span class="nw">${money(v, m)}</span>`);
+  return partes.length ? partes.join(' · ') : money(0);
+}
+
+/** Selector de moneda reutilizable. */
+const selectorMoneda = (nombre, actual, extra = '') => `<select name="${nombre}" ${extra}>` +
+  Object.entries(SIMBOLOS).map(([c, sim]) =>
+    `<option value="${c}" ${(actual || S.empresa?.moneda) === c ? 'selected' : ''}>${sim} · ${c}</option>`).join('') +
+  '</select>';
 const fecha = (f) => (f ? f.split('-').reverse().join('/') : '—');
 const mesNombre = (m) => {
   const [a, mm] = m.split('-');
@@ -268,7 +287,11 @@ function tabla({ columnas, filas, vacio = 'No hay registros', acciones }) {
     const tds = columnas.map((c) => `<td class="${c.num ? 'num' : ''}">${c.v(f, i)}</td>`).join('');
     return `<tr>${tds}${acciones ? `<td class="num" style="white-space:nowrap">${acciones(f, i)}</td>` : ''}</tr>`;
   }).join('');
-  return `<div class="tabla-scroll"><table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`;
+  // Las tablas de pocas columnas (resúmenes por moneda) no necesitan ancho
+  // mínimo: así caben en las medias columnas del panel y de reportes.
+  const n = columnas.length + (acciones ? 1 : 0);
+  const compacta = n <= 3 ? ' compacta' : (n <= 5 ? ' media' : '');
+  return `<div class="tabla-scroll${compacta}"><table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`;
 }
 
 const chip = (estado) => `<span class="chip ${esc(estado)}">${esc(estado)}</span>`;
@@ -285,9 +308,42 @@ vistas.panel = async function () {
   const r = await api(`/api/reportes/resumen?desde=${desde}&hasta=${hasta}`);
   const cxc = await api('/api/reportes/cuentas-por-cobrar');
 
+  // Un bloque por moneda: los importes nunca se mezclan ni se convierten
+  const bloque = (m) => {
+    const d = r.porMoneda[m];
+    const conMovimiento = d.nIngresos || d.nGastos || d.nFacturas || d.nPorCobrar || d.inventarioArticulos;
+    if (!conMovimiento && m !== S.empresa.moneda) return '';
+    return `
+    <div class="tarjeta" style="padding:.9rem 1rem 1.1rem">
+      <h3 style="display:flex;align-items:center;gap:.5rem">
+        <span class="chip pagada" style="font-size:.8rem">${esc(d.simbolo)}</span>
+        <span style="color:var(--suave);font-weight:600;font-size:.9rem">${esc(m)}</span>
+      </h3>
+      <div class="rejilla kpis">
+        <div class="kpi verde"><div class="etq">Ingresos</div><div class="val">${money(d.ingresos, m)}</div><div class="nota">${d.nIngresos} recibos</div></div>
+        <div class="kpi rojo"><div class="etq">Gastos</div><div class="val">${money(d.gastos, m)}</div><div class="nota">${d.nGastos} registros</div></div>
+        <div class="kpi ${d.balance >= 0 ? 'azul' : 'rojo'}"><div class="etq">Utilidad</div><div class="val">${money(d.balance, m)}</div><div class="nota">Ingresos − gastos</div></div>
+        <div class="kpi ambar"><div class="etq">Por cobrar</div><div class="val">${money(d.porCobrar, m)}</div><div class="nota">${d.nPorCobrar} facturas · ${d.nVencidas} vencidas</div></div>
+        <div class="kpi azul"><div class="etq">Facturado</div><div class="val">${money(d.facturado, m)}</div><div class="nota">${d.nFacturas} facturas</div></div>
+        <div class="kpi"><div class="etq">ITBIS a pagar</div><div class="val">${money(d.itbisPagar, m)}</div><div class="nota">Ventas ${money(d.itbisVentas, m)} − compras ${money(d.itbisCompras, m)}</div></div>
+        ${d.inventarioArticulos ? `<div class="kpi"><div class="etq">Inventario</div><div class="val">${money(d.inventarioValor, m)}</div><div class="nota">${d.inventarioArticulos} artículos</div></div>` : ''}
+      </div>
+      <div class="dos" style="margin-top:1rem">
+        <div class="tarjeta" style="margin:0">
+          <h3>Ingresos y gastos · últimos 12 meses</h3>
+          <canvas id="gBarras_${m}"></canvas>
+          <div style="font-size:.8rem;color:var(--suave);margin-top:.4rem">
+            <span style="color:#0f9d58">■</span> Ingresos &nbsp; <span style="color:#d93b3b">■</span> Gastos &nbsp;·&nbsp; en ${esc(d.simbolo)}
+          </div>
+        </div>
+        <div class="tarjeta" style="margin:0"><h3>Gastos por categoría</h3><canvas id="gDona_${m}"></canvas></div>
+      </div>
+    </div>`;
+  };
+
   $('#vista').innerHTML = `
   <div class="encabezado">
-    <div><h1>Panel de control</h1><div class="sub">Resumen del ${fecha(desde)} al ${fecha(hasta)}</div></div>
+    <div><h1>Panel de control</h1><div class="sub">Resumen del ${fecha(desde)} al ${fecha(hasta)} · cada moneda por separado, sin conversiones</div></div>
     <div class="filtros" style="margin:0">
       <div><label>Desde</label><input type="date" id="pDesde" value="${desde}"></div>
       <div><label>Hasta</label><input type="date" id="pHasta" value="${hasta}"></div>
@@ -295,17 +351,7 @@ vistas.panel = async function () {
     </div>
   </div>
 
-  <div class="rejilla kpis" style="margin-bottom:1rem">
-    <div class="kpi verde"><div class="etq">Ingresos</div><div class="val">${money(r.ingresos)}</div><div class="nota">${r.nIngresos} recibos</div></div>
-    <div class="kpi rojo"><div class="etq">Gastos</div><div class="val">${money(r.gastos)}</div><div class="nota">${r.nGastos} registros</div></div>
-    <div class="kpi ${r.balance >= 0 ? 'azul' : 'rojo'}"><div class="etq">Utilidad</div><div class="val">${money(r.balance)}</div><div class="nota">Ingresos − gastos</div></div>
-    <div class="kpi ambar"><div class="etq">Por cobrar</div><div class="val">${money(r.porCobrar)}</div><div class="nota">${r.nPorCobrar} facturas · ${r.nVencidas} vencidas</div></div>
-    <div class="kpi azul"><div class="etq">Facturado</div><div class="val">${money(r.facturado)}</div><div class="nota">${r.nFacturas} facturas</div></div>
-    <div class="kpi"><div class="etq">ITBIS a pagar</div><div class="val">${money(r.itbisPagar)}</div><div class="nota">Ventas ${money(r.itbisVentas)} − compras ${money(r.itbisCompras)}</div></div>
-    ${r.inventarioArticulos ? `<div class="kpi ${r.bajoMinimo.length ? 'ambar' : ''}"><div class="etq">Inventario</div>
-      <div class="val">${money(r.inventarioValor)}</div>
-      <div class="nota">${r.inventarioArticulos} artículos${r.bajoMinimo.length ? ` · <b style="color:var(--rojo)">${r.bajoMinimo.length} por reponer</b>` : ''}</div></div>` : ''}
-  </div>
+  ${r.monedas.map(bloque).join('')}
 
   ${r.bajoMinimo.length ? `<div class="tarjeta" style="border-left:4px solid var(--ambar)">
     <h3>⚠️ Artículos por reponer</h3>
@@ -314,22 +360,11 @@ vistas.panel = async function () {
         { t: 'Artículo', v: (p) => `<b>${esc(p.nombre)}</b>` },
         { t: 'Existencia', num: 1, v: (p) => `<b style="color:${p.existencia <= 0 ? 'var(--rojo)' : 'var(--ambar)'}">${n2(p.existencia)} ${esc(p.unidad)}</b>` },
         { t: 'Mínimo', num: 1, v: (p) => n2(p.minimo) },
-        { t: 'Costo de reposición', num: 1, v: (p) => money(Math.max(p.minimo - p.existencia, 0) * p.costo) },
+        { t: 'Costo de reposición', num: 1, v: (p) => money(Math.max(p.minimo - p.existencia, 0) * p.costo, p.moneda) },
       ], filas: r.bajoMinimo.slice(0, 8),
       acciones: (p) => `<button class="btn-mini btn-primario" onclick="movimiento(${p.id},'entrada')">Registrar entrada</button>`,
     })}
   </div>` : ''}
-
-  <div class="dos">
-    <div class="tarjeta">
-      <h3>Ingresos y gastos · últimos 12 meses</h3>
-      <canvas id="gBarras"></canvas>
-      <div style="font-size:.8rem;color:var(--suave);margin-top:.4rem">
-        <span style="color:#0f9d58">■</span> Ingresos &nbsp; <span style="color:#d93b3b">■</span> Gastos
-      </div>
-    </div>
-    <div class="tarjeta"><h3>Gastos por categoría</h3><canvas id="gDona"></canvas></div>
-  </div>
 
   <div class="dos">
     <div class="tarjeta">
@@ -339,24 +374,31 @@ vistas.panel = async function () {
           { t: 'Factura', v: (f) => `<a onclick="verDocumento(${f.id})" style="cursor:pointer">${esc(f.numero)}</a>` },
           { t: 'Cliente', v: (f) => esc(f.cliente || '—') },
           { t: 'Vence', v: (f) => `${fecha(f.vencimiento)} ${f.vencida ? '<span class="chip vencida">vencida</span>' : ''}` },
-          { t: 'Balance', num: 1, v: (f) => money(f.balance) },
+          { t: 'Balance', num: 1, v: (f) => money(f.balance, f.moneda) },
         ], filas: cxc.slice(0, 10), vacio: 'No hay facturas pendientes. 🎉',
       })}
     </div>
     <div class="tarjeta">
       <h3>Mejores clientes</h3>
-      ${tabla({
-        columnas: [{ t: 'Cliente', v: (f) => esc(f.nombre) }, { t: 'Facturado', num: 1, v: (f) => money(f.total) }],
-        filas: r.topClientes, vacio: 'Aún no hay facturación en el período',
-      })}
+      ${r.monedas.map((m) => {
+        const top = r.porMoneda[m].topClientes;
+        if (!top.length) return '';
+        return `<h4 style="margin:.6rem 0 .3rem;color:var(--suave);font-size:.82rem">En ${esc(r.porMoneda[m].simbolo)}</h4>` +
+          tabla({ columnas: [{ t: 'Cliente', v: (f) => esc(f.nombre) }, { t: 'Facturado', num: 1, v: (f) => money(f.total, m) }], filas: top });
+      }).join('') || '<div class="vacio">Aún no hay facturación en el período</div>'}
     </div>
   </div>`;
 
-  graficoBarras($('#gBarras'), r.serie, {
-    series: [{ campo: 'ingresos', color: '#0f9d58' }, { campo: 'gastos', color: '#d93b3b' }],
-    etiqueta: (d) => mesNombre(d.mes), alto: 250,
-  });
-  graficoDona($('#gDona'), r.gastosCat, { alto: 250 });
+  for (const m of r.monedas) {
+    const d = r.porMoneda[m];
+    const b = document.getElementById('gBarras_' + m);
+    const o = document.getElementById('gDona_' + m);
+    if (b) graficoBarras(b, d.serie, {
+      series: [{ campo: 'ingresos', color: '#0f9d58' }, { campo: 'gastos', color: '#d93b3b' }],
+      etiqueta: (x) => mesNombre(x.mes), alto: 250,
+    });
+    if (o) graficoDona(o, d.gastosCat, { alto: 250 });
+  }
   $('#pAplicar').onclick = () => {
     S.cache.panelDesde = $('#pDesde').value; S.cache.panelHasta = $('#pHasta').value; irA('panel');
   };
@@ -379,7 +421,7 @@ function vistaDocumentos(tipo) {
     $('#vista').innerHTML = `
     <div class="encabezado">
       <div><h1>${esFactura ? 'Facturas' : 'Presupuestos'}</h1>
-        <div class="sub">${docs.length} documentos · Total ${money(total)}${esFactura ? ` · Por cobrar ${money(balance)}` : ''}</div></div>
+        <div class="sub">${docs.length} documentos · Total ${totalPorMoneda(docs.filter((d) => d.estado !== 'anulada'), 'total')}${esFactura ? ` · Por cobrar ${totalPorMoneda(docs.filter((d) => ['emitida', 'parcial'].includes(d.estado)), 'balance')}` : ''}</div></div>
       <div style="display:flex;gap:.5rem">
         <button id="btnExport">⬇ Exportar CSV</button>
         <button class="btn-primario" id="btnNuevo">+ ${esFactura ? 'Nueva factura' : 'Nuevo presupuesto'}</button>
@@ -402,8 +444,9 @@ function vistaDocumentos(tipo) {
           { t: 'Fecha', v: (d) => fecha(d.fecha) },
           { t: 'Cliente', v: (d) => esc(d.cliente || '—') },
           { t: esFactura ? 'Vence' : 'Válido hasta', v: (d) => fecha(d.vencimiento) },
-          { t: 'Total', num: 1, v: (d) => `<b>${money(d.total)}</b>` },
-          ...(esFactura ? [{ t: 'Balance', num: 1, v: (d) => (d.balance > 0.009 && d.estado !== 'anulada' ? `<span style="color:var(--rojo)">${money(d.balance)}</span>` : '—') }] : []),
+          { t: 'Moneda', v: (d) => esc(simbolo(d.moneda)) },
+          { t: 'Total', num: 1, v: (d) => `<b>${money(d.total, d.moneda)}</b>` },
+          ...(esFactura ? [{ t: 'Balance', num: 1, v: (d) => (d.balance > 0.009 && d.estado !== 'anulada' ? `<span style="color:var(--rojo)">${money(d.balance, d.moneda)}</span>` : '—') }] : []),
           { t: 'Estado', v: (d) => chip(d.estado) },
         ],
         filas: docs,
@@ -443,6 +486,8 @@ window.editarDocumento = async function (tipo, id) {
   if (id) doc = await api('/api/documentos/' + id);
   EDITOR = {
     tipo, id, productos,
+    moneda: doc?.moneda || S.empresa.moneda,
+    bloqueada: !!(doc && doc.pagos && doc.pagos.length),   // con cobros ya no se puede cambiar
     items: doc ? doc.items.map((i) => ({ ...i })) : [{ descripcion: '', cantidad: 1, precio: 0, descuento: 0, itbis: 1 }],
   };
   const esFactura = tipo === 'factura';
@@ -460,6 +505,9 @@ window.editarDocumento = async function (tipo, id) {
           </select></div>
         <div><label>O nombre del cliente ocasional</label><input name="cliente_nombre" value="${esc(doc?.contacto_id ? '' : doc?.cliente_nombre || '')}"></div>
         <div><label>RNC / Cédula</label><input name="cliente_rnc" value="${esc(doc?.contacto_id ? '' : doc?.cliente_rnc || '')}"></div>
+        <div><label>Moneda</label>
+          ${selectorMoneda('moneda', doc?.moneda, 'id="selMoneda"' + (doc && doc.pagos && doc.pagos.length ? ' disabled' : ''))}
+          ${doc && doc.pagos && doc.pagos.length ? '<div style="font-size:.76rem;color:var(--suave);margin-top:.2rem">No se puede cambiar: ya tiene cobros.</div>' : ''}</div>
         <div><label>Fecha</label><input type="date" name="fecha" value="${doc?.fecha || hoy()}"></div>
         <div><label>${esFactura ? 'Vencimiento' : 'Válido hasta'}</label><input type="date" name="vencimiento" value="${doc?.vencimiento || ''}"></div>
         <div><label>Estado</label><select name="estado">
@@ -502,6 +550,8 @@ window.editarDocumento = async function (tipo, id) {
       pintarLineas();
       $('#addLinea', dlg).onclick = () => { EDITOR.items.push({ descripcion: '', cantidad: 1, precio: 0, descuento: 0, itbis: 1 }); pintarLineas(); };
       $('#tDesc', dlg).oninput = recalcular;
+      const selMon = $('#selMoneda', dlg);
+      if (selMon) selMon.onchange = () => { EDITOR.moneda = selMon.value; pintarLineas(); };
       $('#selCliente', dlg).onchange = (e) => {
         if (e.target.value) { $('[name=cliente_nombre]', dlg).value = ''; $('[name=cliente_rnc]', dlg).value = ''; }
       };
@@ -511,7 +561,11 @@ window.editarDocumento = async function (tipo, id) {
 
 function pintarLineas() {
   const tb = $('#lineas');
-  const ops = EDITOR.productos.map((p) => `<option value="${p.id}">${esc(p.nombre)}</option>`).join('');
+  const mismos = EDITOR.productos.filter((p) => (p.moneda || 'DOP') === EDITOR.moneda);
+  const otros = EDITOR.productos.filter((p) => (p.moneda || 'DOP') !== EDITOR.moneda);
+  const opcion = (p) => `<option value="${p.id}">${esc(p.nombre)}</option>`;
+  const ops = `<optgroup label="En ${esc(simbolo(EDITOR.moneda))}">${mismos.map(opcion).join('')}</optgroup>` +
+    (otros.length ? `<optgroup label="En otra moneda — revise el precio">${otros.map(opcion).join('')}</optgroup>` : '');
   tb.innerHTML = EDITOR.items.map((it, i) => `
     <tr>
       <td><input value="${esc(it.descripcion)}" data-i="${i}" data-c="descripcion"></td>
@@ -531,7 +585,14 @@ function pintarLineas() {
       else if (c === 'producto_id') {
         const p = EDITOR.productos.find((x) => x.id === Number(el.value));
         EDITOR.items[i].producto_id = el.value ? Number(el.value) : null;
-        if (p) { EDITOR.items[i].descripcion = p.nombre + (p.descripcion ? ' — ' + p.descripcion : ''); EDITOR.items[i].precio = p.precio; EDITOR.items[i].itbis = p.itbis; pintarLineas(); return; }
+        if (p) {
+          EDITOR.items[i].descripcion = p.nombre + (p.descripcion ? ' — ' + p.descripcion : '');
+          EDITOR.items[i].precio = p.precio; EDITOR.items[i].itbis = p.itbis;
+          if ((p.moneda || 'DOP') !== EDITOR.moneda) {
+            toast(`"${p.nombre}" tiene el precio en ${simbolo(p.moneda)} y el documento está en ${simbolo(EDITOR.moneda)}. Revise el precio.`, 'error');
+          }
+          pintarLineas(); return;
+        }
       } else if (c === 'descripcion') EDITOR.items[i][c] = el.value;
       else EDITOR.items[i][c] = Number(el.value) || 0;
       recalcular();
@@ -551,21 +612,22 @@ function recalcular() {
   EDITOR.items.forEach((it, i) => {
     const imp = n2((Number(it.cantidad) || 0) * (Number(it.precio) || 0) * (1 - (Number(it.descuento) || 0) / 100));
     it._imp = imp; sub += imp;
-    const celda = $(`[data-imp="${i}"]`); if (celda) celda.textContent = money(imp);
+    const celda = $(`[data-imp="${i}"]`); if (celda) celda.textContent = money(imp, EDITOR.moneda);
   });
   sub = n2(sub);
   const dg = Math.min(Number($('#tDesc')?.value) || 0, sub);
   const factor = sub > 0 ? (sub - dg) / sub : 0;
   const itbis = n2(EDITOR.items.reduce((a, it) => a + (it.itbis ? it._imp * factor * (tasa / 100) : 0), 0));
-  $('#tSub').textContent = money(sub);
-  $('#tItbis').textContent = money(itbis);
-  $('#tTotal').textContent = money(n2(sub - dg + itbis));
+  $('#tSub').textContent = money(sub, EDITOR.moneda);
+  $('#tItbis').textContent = money(itbis, EDITOR.moneda);
+  $('#tTotal').textContent = money(n2(sub - dg + itbis), EDITOR.moneda);
 }
 
 async function guardarDocumento(dlg) {
   const d = datosForm($('#modalCuerpo'));
   const body = {
-    ...d, tipo: EDITOR.tipo, crear_cliente: !d.contacto_id && !!String(d.cliente_nombre || '').trim(),
+    ...d, tipo: EDITOR.tipo, moneda: EDITOR.moneda,
+    crear_cliente: !d.contacto_id && !!String(d.cliente_nombre || '').trim(),
     items: EDITOR.items.filter((i) => String(i.descripcion).trim()),
   };
   if (!body.items.length) throw new Error('Agregue al menos una línea con descripción');
@@ -620,29 +682,30 @@ window.verDocumento = async function (id) {
         <div><label>${esFactura ? 'Vencimiento' : 'Válido hasta'}</label>${fecha(d.vencimiento)}</div>
         ${esFactura ? `<div><label>NCF</label>${esc(d.ncf || '—')}</div>` : ''}
         <div><label>Estado</label>${chip(d.estado)}</div>
+        <div><label>Moneda</label><b>${esc(simbolo(d.moneda))} · ${esc(d.moneda)}</b></div>
       </div>
       ${tabla({
         columnas: [
           { t: 'Descripción', v: (i) => esc(i.descripcion) },
           { t: 'Cant.', num: 1, v: (i) => i.cantidad },
-          { t: 'Precio', num: 1, v: (i) => money(i.precio) },
+          { t: 'Precio', num: 1, v: (i) => money(i.precio, d.moneda) },
           { t: 'Desc.', num: 1, v: (i) => (i.descuento ? i.descuento + '%' : '—') },
-          { t: 'Importe', num: 1, v: (i) => money(i.importe) },
+          { t: 'Importe', num: 1, v: (i) => money(i.importe, d.moneda) },
         ], filas: d.items,
       })}
       <div class="totales" style="margin-top:.6rem">
-        <div><span>Subtotal</span><b>${money(d.subtotal)}</b></div>
-        ${d.descuento ? `<div><span>Descuento</span><b>− ${money(d.descuento)}</b></div>` : ''}
-        <div><span>ITBIS</span><b>${money(d.itbis)}</b></div>
-        <div class="grande"><span>TOTAL</span><b>${money(d.total)}</b></div>
-        ${esFactura ? `<div><span>Pagado</span><b style="color:var(--verde)">${money(d.pagado)}</b></div>
-          <div><span>Balance</span><b style="color:${d.balance > 0.009 ? 'var(--rojo)' : 'var(--verde)'}">${money(d.balance)}</b></div>` : ''}
+        <div><span>Subtotal</span><b>${money(d.subtotal, d.moneda)}</b></div>
+        ${d.descuento ? `<div><span>Descuento</span><b>− ${money(d.descuento, d.moneda)}</b></div>` : ''}
+        <div><span>ITBIS</span><b>${money(d.itbis, d.moneda)}</b></div>
+        <div class="grande"><span>TOTAL</span><b>${money(d.total, d.moneda)}</b></div>
+        ${esFactura ? `<div><span>Pagado</span><b style="color:var(--verde)">${money(d.pagado, d.moneda)}</b></div>
+          <div><span>Balance</span><b style="color:${d.balance > 0.009 ? 'var(--rojo)' : 'var(--verde)'}">${money(d.balance, d.moneda)}</b></div>` : ''}
       </div>
       ${d.pagos?.length ? `<h3 style="margin-top:1rem">Pagos recibidos</h3>${tabla({
         columnas: [
           { t: 'Recibo', v: (p) => `<a onclick="imprimirRecibo(${p.id})" style="cursor:pointer">${esc(p.recibo)}</a>` },
           { t: 'Fecha', v: (p) => fecha(p.fecha) }, { t: 'Método', v: (p) => esc(p.metodo) },
-          { t: 'Monto', num: 1, v: (p) => money(p.monto) },
+          { t: 'Monto', num: 1, v: (p) => money(p.monto, d.moneda) },
         ], filas: d.pagos,
       })}` : ''}
       ${d.notas ? `<p style="margin-top:.9rem"><b>Notas:</b> ${esc(d.notas)}</p>` : ''}`,
@@ -750,7 +813,9 @@ window.cobrar = async function (id) {
   modal({
     titulo: `Registrar cobro · ${d.numero}`, ancho: '520px',
     cuerpo: `
-      <p style="margin:0 0 .8rem;color:var(--suave)">Balance pendiente: <b style="color:var(--rojo)">${money(d.balance)}</b></p>
+      <p style="margin:0 0 .8rem;color:var(--suave)">Balance pendiente:
+        <b style="color:var(--rojo)">${money(d.balance, d.moneda)}</b>
+        <span style="margin-left:.4rem">— el cobro se registra en ${esc(simbolo(d.moneda))} (${esc(d.moneda)}), la moneda de la factura</span></p>
       <div class="campos">
         <div><label>Fecha</label><input type="date" name="fecha" value="${hoy()}"></div>
         <div><label>Monto</label><input type="number" step="0.01" name="monto" value="${n2(d.balance)}"></div>
@@ -781,7 +846,7 @@ vistas.recibos = async function () {
 
   $('#vista').innerHTML = `
     <div class="encabezado">
-      <div><h1>Ingresos y recibos</h1><div class="sub">${rows.length} registros · Total ${money(total)}</div></div>
+      <div><h1>Ingresos y recibos</h1><div class="sub">${rows.length} registros · Total ${totalPorMoneda(rows)}</div></div>
       <div style="display:flex;gap:.5rem">
         <button id="btnExport">⬇ Exportar CSV</button>
         <button class="btn-primario" id="btnNuevo">+ Registrar ingreso</button>
@@ -804,7 +869,8 @@ vistas.recibos = async function () {
           { t: 'Factura', v: (r) => (r.factura ? esc(r.factura) : '—') },
           { t: 'Categoría', v: (r) => esc(r.categoria) },
           { t: 'Método', v: (r) => esc(r.metodo) },
-          { t: 'Monto', num: 1, v: (r) => `<b style="color:var(--verde)">${money(r.monto)}</b>` },
+          { t: 'Moneda', v: (r) => esc(simbolo(r.moneda)) },
+          { t: 'Monto', num: 1, v: (r) => `<b style="color:var(--verde)">${money(r.monto, r.moneda)}</b>` },
         ],
         filas: rows, vacio: 'Aún no hay ingresos registrados',
         acciones: (r) => `<button class="btn-mini" title="Imprimir" onclick="imprimirRecibo(${r.id})">🖨</button>
@@ -831,9 +897,11 @@ async function nuevoIngreso() {
       <div class="campos">
         <div class="campo-ancho"><label>Aplicar a factura (opcional)</label>
           <select name="documento_id" id="selFac"><option value="">— Ingreso libre —</option>
-          ${facturas.map((d) => `<option value="${d.id}" data-bal="${d.balance}">${esc(d.numero)} · ${esc(d.cliente || '')} · pendiente ${n2(d.balance)}</option>`).join('')}</select></div>
+          ${facturas.map((d) => `<option value="${d.id}" data-bal="${d.balance}" data-moneda="${esc(d.moneda)}">${esc(d.numero)} · ${esc(d.cliente || '')} · pendiente ${esc(simbolo(d.moneda))} ${n2(d.balance)}</option>`).join('')}</select></div>
         <div class="campo-ancho"><label>Concepto</label><input name="concepto" placeholder="Ej. Abono cliente / Alquiler"></div>
         <div><label>Fecha</label><input type="date" name="fecha" value="${hoy()}"></div>
+        <div><label>Moneda</label>${selectorMoneda('moneda', null, 'id="iMoneda"')}
+          <div id="iMonedaNota" style="font-size:.76rem;color:var(--suave);margin-top:.2rem"></div></div>
         <div><label>Monto</label><input type="number" step="0.01" name="monto" id="mMonto" value="0"></div>
         <div><label>Categoría</label><select name="categoria">
           ${['Ventas', 'Servicios', 'Alquileres', 'Intereses', 'Otros ingresos'].map((c) => `<option>${c}</option>`).join('')}</select></div>
@@ -848,6 +916,7 @@ async function nuevoIngreso() {
       { texto: 'Cancelar', accion: () => {} },
       { texto: 'Guardar y emitir recibo', clase: 'btn-primario', accion: async () => {
         const b = datosForm($('#modalCuerpo'));
+        b.moneda = $('#iMoneda').value;          // el campo puede estar deshabilitado
         const rec = await api('/api/ingresos', { method: 'POST', body: b });
         toast('Recibo ' + rec.recibo + ' registrado', 'ok');
         setTimeout(() => imprimirRecibo(rec.id), 300);
@@ -855,9 +924,16 @@ async function nuevoIngreso() {
       } },
     ],
     alAbrir: () => {
-      $('#selFac').onchange = (e) => {
+      const sel = $('#selFac'), mon = $('#iMoneda'), nota = $('#iMonedaNota');
+      sel.onchange = (e) => {
         const op = e.target.selectedOptions[0];
-        if (op && op.dataset.bal) $('#mMonto').value = n2(op.dataset.bal);
+        if (op && op.dataset.bal) {
+          $('#mMonto').value = n2(op.dataset.bal);
+          mon.value = op.dataset.moneda; mon.disabled = true;
+          nota.textContent = `Fijada por la factura (${simbolo(op.dataset.moneda)}).`;
+        } else {
+          mon.disabled = false; nota.textContent = '';
+        }
       };
     },
   });
@@ -879,7 +955,7 @@ vistas.gastos = async function () {
 
   $('#vista').innerHTML = `
     <div class="encabezado">
-      <div><h1>Control de gastos</h1><div class="sub">${rows.length} registros · Total ${money(total)} · ITBIS deducible ${money(itbis)}</div></div>
+      <div><h1>Control de gastos</h1><div class="sub">${rows.length} registros · Total ${totalPorMoneda(rows)} · ITBIS deducible ${totalPorMoneda(rows.filter((g) => g.deducible), 'itbis')}</div></div>
       <div style="display:flex;gap:.5rem">
         <button id="btnExport">⬇ Exportar CSV</button>
         <button class="btn-primario" id="btnNuevo">+ Registrar gasto</button>
@@ -901,9 +977,10 @@ vistas.gastos = async function () {
           { t: 'Categoría', v: (g) => esc(g.categoria) },
           { t: 'Proveedor', v: (g) => esc(g.proveedor || '—') },
           { t: 'NCF', v: (g) => esc(g.ncf || '—') },
-          { t: 'Subtotal', num: 1, v: (g) => money(g.subtotal) },
-          { t: 'ITBIS', num: 1, v: (g) => money(g.itbis) },
-          { t: 'Total', num: 1, v: (g) => `<b style="color:var(--rojo)">${money(g.monto)}</b>` },
+          { t: 'Moneda', v: (g) => esc(simbolo(g.moneda)) },
+          { t: 'Subtotal', num: 1, v: (g) => money(g.subtotal, g.moneda) },
+          { t: 'ITBIS', num: 1, v: (g) => money(g.itbis, g.moneda) },
+          { t: 'Total', num: 1, v: (g) => `<b style="color:var(--rojo)">${money(g.monto, g.moneda)}</b>` },
         ],
         filas: rows, vacio: 'Aún no hay gastos registrados',
         acciones: (g) => `<button class="btn-mini" onclick="editarGasto(${g.id})">Editar</button>
@@ -934,6 +1011,7 @@ window.editarGasto = async function (id) {
         <div><label>Categoría</label><select name="categoria">${cats.map((c) => `<option ${g?.categoria === c ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
         <div><label>Proveedor</label><select name="contacto_id"><option value="">—</option>
           ${proveedores.map((p) => `<option value="${p.id}" ${g?.contacto_id === p.id ? 'selected' : ''}>${esc(p.nombre)}</option>`).join('')}</select></div>
+        <div><label>Moneda</label>${selectorMoneda('moneda', g?.moneda)}</div>
         <div><label>Subtotal</label><input type="number" step="0.01" name="subtotal" id="gSub" value="${g?.subtotal || 0}"></div>
         <div><label>ITBIS</label><input type="number" step="0.01" name="itbis" id="gItbis" value="${g?.itbis || 0}">
           <button type="button" class="btn-mini" id="calcItbis" style="margin-top:.25rem">Calcular ${S.empresa.itbis_tasa}%</button></div>
@@ -1053,7 +1131,7 @@ window.verContacto = async function (id) {
           { t: 'Tipo', v: (d) => esc(d.tipo) },
           { t: 'Número', v: (d) => `<a onclick="cerrarModalYVer(${d.id})" style="cursor:pointer">${esc(d.numero)}</a>` },
           { t: 'Fecha', v: (d) => fecha(d.fecha) },
-          { t: 'Total', num: 1, v: (d) => money(d.total) },
+          { t: 'Total', num: 1, v: (d) => money(d.total, d.moneda) },
           { t: 'Estado', v: (d) => chip(d.estado) },
         ], filas: c.documentos, vacio: 'Sin documentos',
       })}`,
@@ -1076,8 +1154,9 @@ vistas.productos = async function () {
         { t: 'Nombre', v: (p) => `<b>${esc(p.nombre)}</b>${p.activo ? '' : ' <span class="chip borrador">inactivo</span>'}` },
         { t: 'Descripción', v: (p) => esc((p.descripcion || '').slice(0, 60)) },
         { t: 'Unidad', v: (p) => esc(p.unidad) },
-        { t: 'Costo', num: 1, v: (p) => money(p.costo) },
-        { t: 'Precio', num: 1, v: (p) => `<b>${money(p.precio)}</b>` },
+        { t: 'Moneda', v: (p) => esc(simbolo(p.moneda)) },
+        { t: 'Costo', num: 1, v: (p) => money(p.costo, p.moneda) },
+        { t: 'Precio', num: 1, v: (p) => `<b>${money(p.precio, p.moneda)}</b>` },
         { t: 'Margen', num: 1, v: (p) => (p.costo > 0 ? Math.round(((p.precio - p.costo) / p.costo) * 100) + '%' : '—') },
         { t: 'ITBIS', v: (p) => (p.itbis ? 'Sí' : 'No') },
         { t: 'Existencia', num: 1, v: (p) => (p.inventario
@@ -1100,6 +1179,7 @@ window.editarProducto = async function (id) {
       <div><label>Código</label><input name="codigo" value="${esc(p?.codigo || '')}"></div>
       <div style="grid-column:span 2"><label>Nombre *</label><input name="nombre" value="${esc(p?.nombre || '')}"></div>
       <div class="campo-ancho"><label>Descripción</label><textarea name="descripcion">${esc(p?.descripcion || '')}</textarea></div>
+      <div><label>Moneda del precio</label>${selectorMoneda('moneda', p?.moneda)}</div>
       <div><label>Unidad</label><input name="unidad" value="${esc(p?.unidad || 'ud')}"></div>
       <div><label>Costo</label><input type="number" step="0.01" name="costo" value="${p?.costo || 0}"></div>
       <div><label>Precio de venta</label><input type="number" step="0.01" name="precio" value="${p?.precio || 0}"></div>
@@ -1150,7 +1230,7 @@ vistas.inventario = async function () {
   $('#vista').innerHTML = `
     <div class="encabezado">
       <div><h1>Inventario</h1>
-        <div class="sub">${inv.filas.length} artículos con control de existencias · Valor ${money(inv.valor)}${inv.bajos ? ` · <b style="color:var(--rojo)">${inv.bajos} bajo el mínimo</b>` : ''}</div></div>
+        <div class="sub">${inv.filas.length} artículos con control de existencias · Valor ${Object.entries(inv.valorPorMoneda || {}).map(([m, v]) => money(v, m)).join(' · ') || money(0)}${inv.bajos ? ` · <b style="color:var(--rojo)">${inv.bajos} bajo el mínimo</b>` : ''}</div></div>
       <div style="display:flex;gap:.5rem">
         <button id="btnEntrada" class="btn-primario">+ Entrada de mercancía</button>
         <button id="btnAjuste">Ajustar conteo</button>
@@ -1173,9 +1253,9 @@ vistas.inventario = async function () {
             return `<b style="color:${c}">${n2(p.existencia)}</b> <span style="color:var(--suave)">${esc(p.unidad)}</span>`;
           } },
           { t: 'Mínimo', num: 1, v: (p) => n2(p.minimo) },
-          { t: 'Costo', num: 1, v: (p) => money(p.costo) },
-          { t: 'Valor', num: 1, v: (p) => money(p.valor) },
-          { t: 'Precio venta', num: 1, v: (p) => money(p.precio) },
+          { t: 'Costo', num: 1, v: (p) => money(p.costo, p.moneda) },
+          { t: 'Valor', num: 1, v: (p) => money(p.valor, p.moneda) },
+          { t: 'Precio venta', num: 1, v: (p) => money(p.precio, p.moneda) },
           { t: 'Estado', v: (p) => (p.existencia <= 0 ? '<span class="chip anulada">agotado</span>'
             : p.existencia <= p.minimo ? '<span class="chip parcial">reponer</span>' : '<span class="chip pagada">ok</span>') },
         ],
@@ -1248,7 +1328,7 @@ window.verKardex = async function (id) {
     titulo: `Movimientos · ${k.producto.nombre}`, ancho: 'min(860px,96vw)',
     cuerpo: `<p style="margin:0 0 .8rem;color:var(--suave)">Existencia actual:
       <b style="color:var(--texto)">${n2(k.producto.existencia)} ${esc(k.producto.unidad)}</b> ·
-      Mínimo ${n2(k.producto.minimo)} · Valor ${money(k.producto.existencia * k.producto.costo)}</p>
+      Mínimo ${n2(k.producto.minimo)} · Valor ${money(k.producto.existencia * k.producto.costo, k.producto.moneda)}</p>
       ${tabla({
         columnas: [
           { t: 'Fecha', v: (m) => fecha(m.fecha) },
@@ -1276,9 +1356,26 @@ vistas.reportes = async function () {
     api('/api/reportes/cuentas-por-cobrar'),
   ]);
 
+  const bloqueEstado = (b) => `
+    <div style="margin-bottom:1.2rem">
+      <h4 style="margin:.2rem 0 .5rem;display:flex;align-items:center;gap:.4rem">
+        <span class="chip pagada">${esc(b.simbolo)}</span>
+        <span style="color:var(--suave);font-size:.85rem">${esc(b.moneda)}</span></h4>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.4rem">
+        <div><h4 style="color:var(--verde);margin:.3rem 0">Ingresos</h4>
+          ${tabla({ columnas: [{ t: 'Categoría', v: (x) => esc(x.categoria) }, { t: 'Monto', num: 1, v: (x) => money(x.total, b.moneda) }], filas: b.ingresos, vacio: 'Sin ingresos' })}
+          <div class="totales" style="width:100%"><div class="grande"><span>Total</span><b style="color:var(--verde)">${money(b.totalIngresos, b.moneda)}</b></div></div></div>
+        <div><h4 style="color:var(--rojo);margin:.3rem 0">Gastos</h4>
+          ${tabla({ columnas: [{ t: 'Categoría', v: (x) => esc(x.categoria) }, { t: 'Monto', num: 1, v: (x) => money(x.total, b.moneda) }], filas: b.gastos, vacio: 'Sin gastos' })}
+          <div class="totales" style="width:100%"><div class="grande"><span>Total</span><b style="color:var(--rojo)">${money(b.totalGastos, b.moneda)}</b></div></div></div>
+      </div>
+      <div class="totales" style="margin-top:.7rem"><div class="grande"><span>UTILIDAD EN ${esc(b.simbolo)}</span>
+        <b style="color:${b.utilidad >= 0 ? 'var(--verde)' : 'var(--rojo)'}">${money(b.utilidad, b.moneda)}</b></div></div>
+    </div>`;
+
   $('#vista').innerHTML = `
     <div class="encabezado">
-      <div><h1>Reportes</h1><div class="sub">Período ${fecha(desde)} — ${fecha(hasta)}</div></div>
+      <div><h1>Reportes</h1><div class="sub">Período ${fecha(desde)} — ${fecha(hasta)} · cada moneda por separado</div></div>
       <div class="filtros" style="margin:0">
         <div><label>Desde</label><input type="date" id="rDesde" value="${desde}"></div>
         <div><label>Hasta</label><input type="date" id="rHasta" value="${hasta}"></div>
@@ -1290,26 +1387,18 @@ vistas.reportes = async function () {
     <div class="dos">
       <div class="tarjeta">
         <h3>Estado de resultados</h3>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.4rem">
-          <div><h4 style="color:var(--verde);margin:.3rem 0">Ingresos</h4>
-            ${tabla({ columnas: [{ t: 'Categoría', v: (x) => esc(x.categoria) }, { t: 'Monto', num: 1, v: (x) => money(x.total) }], filas: estado.ingresos, vacio: 'Sin ingresos' })}
-            <div class="totales" style="width:100%"><div class="grande"><span>Total</span><b style="color:var(--verde)">${money(estado.totalIngresos)}</b></div></div></div>
-          <div><h4 style="color:var(--rojo);margin:.3rem 0">Gastos</h4>
-            ${tabla({ columnas: [{ t: 'Categoría', v: (x) => esc(x.categoria) }, { t: 'Monto', num: 1, v: (x) => money(x.total) }], filas: estado.gastos, vacio: 'Sin gastos' })}
-            <div class="totales" style="width:100%"><div class="grande"><span>Total</span><b style="color:var(--rojo)">${money(estado.totalGastos)}</b></div></div></div>
-        </div>
-        <div class="totales" style="margin-top:.8rem"><div class="grande"><span>UTILIDAD DEL PERÍODO</span>
-          <b style="color:${estado.utilidad >= 0 ? 'var(--verde)' : 'var(--rojo)'}">${money(estado.utilidad)}</b></div></div>
+        ${estado.bloques.map(bloqueEstado).join('')}
       </div>
 
       <div class="tarjeta">
         <h3>ITBIS por mes</h3>
         ${tabla({
           columnas: [
-            { t: 'Mes', v: (m) => mesNombre(m.mes) },
-            { t: 'ITBIS ventas', num: 1, v: (m) => money(m.itbisVentas) },
-            { t: 'ITBIS compras', num: 1, v: (m) => money(m.itbisCompras) },
-            { t: 'A pagar', num: 1, v: (m) => `<b>${money(m.aPagar)}</b>` },
+            { t: 'Moneda', v: (m) => esc(m.simbolo) },
+            { t: 'Mes', v: (m) => `<span class="nw">${mesNombre(m.mes)}</span>` },
+            { t: 'ITBIS ventas', num: 1, v: (m) => money(m.itbisVentas, m.moneda) },
+            { t: 'ITBIS compras', num: 1, v: (m) => money(m.itbisCompras, m.moneda) },
+            { t: 'A pagar', num: 1, v: (m) => `<b>${money(m.aPagar, m.moneda)}</b>` },
           ], filas: itbis, vacio: 'Sin movimientos en el período',
         })}
         <p style="font-size:.78rem;color:var(--suave);margin-top:.6rem">Referencial para el formulario IT-1. Confirme siempre con su contador.</p>
@@ -1325,13 +1414,14 @@ vistas.reportes = async function () {
           { t: 'Emitida', v: (f) => fecha(f.fecha) },
           { t: 'Vence', v: (f) => fecha(f.vencimiento) },
           { t: 'Días', num: 1, v: (f) => (f.vencida ? `<span style="color:var(--rojo)">${f.dias}</span>` : '—') },
-          { t: 'Total', num: 1, v: (f) => money(f.total) },
-          { t: 'Pagado', num: 1, v: (f) => money(f.pagado) },
-          { t: 'Balance', num: 1, v: (f) => `<b style="color:var(--rojo)">${money(f.balance)}</b>` },
+          { t: 'Moneda', v: (f) => esc(simbolo(f.moneda)) },
+          { t: 'Total', num: 1, v: (f) => money(f.total, f.moneda) },
+          { t: 'Pagado', num: 1, v: (f) => money(f.pagado, f.moneda) },
+          { t: 'Balance', num: 1, v: (f) => `<b style="color:var(--rojo)">${money(f.balance, f.moneda)}</b>` },
         ], filas: cxc, vacio: 'No hay facturas pendientes',
       })}
       <div class="totales" style="margin-top:.5rem"><div class="grande"><span>Total por cobrar</span>
-        <b>${money(cxc.reduce((a, f) => a + f.balance, 0))}</b></div></div>
+        <b>${totalPorMoneda(cxc, 'balance')}</b></div></div>
     </div>`;
 
   $('#rAplicar').onclick = () => { S.cache.rDesde = $('#rDesde').value; S.cache.rHasta = $('#rHasta').value; irA('reportes'); };
@@ -1359,8 +1449,9 @@ vistas.config = async function () {
         <div><label>Email</label><input name="email" value="${esc(e.email)}"></div>
         <div><label>Sitio web</label><input name="web" value="${esc(e.web)}"></div>
         <div class="campo-ancho"><label>Dirección</label><input name="direccion" value="${esc(e.direccion)}"></div>
-        <div><label>Moneda</label><input name="moneda" value="${esc(e.moneda)}"></div>
-        <div><label>Símbolo</label><input name="simbolo" value="${esc(e.simbolo)}"></div>
+        <div><label>Moneda predeterminada</label>${selectorMoneda('moneda', e.moneda)}
+          <div style="font-size:.76rem;color:var(--suave);margin-top:.2rem">La que viene marcada al crear documentos. Puede cambiarla en cada factura.</div></div>
+        <div><label>Símbolo</label><input name="simbolo" value="${esc(e.simbolo)}" readonly style="background:#f6f8fb"></div>
         <div><label>Tasa ITBIS (%)</label><input type="number" step="0.01" name="itbis_tasa" value="${e.itbis_tasa}"></div>
         <div><label>Validez presupuestos (días)</label><input type="number" name="validez_presupuesto" value="${e.validez_presupuesto}"></div>
         <div class="campo-ancho"><label>Condiciones por defecto</label><textarea name="condiciones">${esc(e.condiciones)}</textarea></div>
@@ -1590,23 +1681,23 @@ function imprimirDocumento(d) {
       </div>
       <div class="bloque"><b>Resumen</b>
         <div>Estado: ${esc(d.estado)}</div>
-        <div>Moneda: ${esc(e.moneda)}</div>
-        ${esFactura ? `<div>Pagado: ${money(d.pagado)}</div><div><b>Balance: ${money(d.balance)}</b></div>` : ''}
+        <div>Moneda: ${esc(d.moneda)} (${esc(simbolo(d.moneda))})</div>
+        ${esFactura ? `<div>Pagado: ${money(d.pagado, d.moneda)}</div><div><b>Balance: ${money(d.balance, d.moneda)}</b></div>` : ''}
       </div>
     </div>
     <table><thead><tr><th style="width:48%">Descripción</th><th style="text-align:right">Cant.</th>
       <th style="text-align:right">Precio</th><th style="text-align:right">Desc.</th><th style="text-align:right">Importe</th></tr></thead>
       <tbody>${d.items.map((i) => `<tr><td>${esc(i.descripcion)}</td>
-        <td style="text-align:right">${i.cantidad}</td><td style="text-align:right">${money(i.precio)}</td>
+        <td style="text-align:right">${i.cantidad}</td><td style="text-align:right">${money(i.precio, d.moneda)}</td>
         <td style="text-align:right">${i.descuento ? i.descuento + '%' : '—'}</td>
-        <td style="text-align:right">${money(i.importe)}</td></tr>`).join('')}</tbody></table>
+        <td style="text-align:right">${money(i.importe, d.moneda)}</td></tr>`).join('')}</tbody></table>
     <div style="display:flex;justify-content:flex-end">
       <table style="width:280px">
-        <tr><td>Subtotal</td><td style="text-align:right">${money(d.subtotal)}</td></tr>
-        ${d.descuento ? `<tr><td>Descuento</td><td style="text-align:right">− ${money(d.descuento)}</td></tr>` : ''}
-        <tr><td>ITBIS (${e.itbis_tasa}%)</td><td style="text-align:right">${money(d.itbis)}</td></tr>
+        <tr><td>Subtotal</td><td style="text-align:right">${money(d.subtotal, d.moneda)}</td></tr>
+        ${d.descuento ? `<tr><td>Descuento</td><td style="text-align:right">− ${money(d.descuento, d.moneda)}</td></tr>` : ''}
+        <tr><td>ITBIS (${e.itbis_tasa}%)</td><td style="text-align:right">${money(d.itbis, d.moneda)}</td></tr>
         <tr><td style="font-size:14px;font-weight:700;border-top:2px solid #12203f">TOTAL</td>
-            <td style="text-align:right;font-size:14px;font-weight:700;border-top:2px solid #12203f">${money(d.total)}</td></tr>
+            <td style="text-align:right;font-size:14px;font-weight:700;border-top:2px solid #12203f">${money(d.total, d.moneda)}</td></tr>
       </table></div>
     ${d.notas ? `<div style="margin-top:10px"><b>Notas:</b> ${esc(d.notas)}</div>` : ''}
     <div class="pie-doc">${esc(d.condiciones || e.condiciones)}</div>
@@ -1622,7 +1713,7 @@ window.imprimirRecibo = async function (id) {
     ${cabeceraDoc('RECIBO DE INGRESO', `
       <div style="margin-top:6px"><b>No.</b> ${esc(r.recibo)}</div>
       <div><b>Fecha:</b> ${fecha(r.fecha)}</div>
-      <div style="margin-top:8px;font-size:17px;font-weight:700">${money(r.monto)}</div>`)}
+      <div style="margin-top:8px;font-size:17px;font-weight:700">${money(r.monto, r.moneda)}</div>`)}
     <div class="bloques">
       <div class="bloque"><b>Recibido de</b>
         <div style="font-weight:600">${esc(r.cliente || '—')}</div>
@@ -1634,14 +1725,15 @@ window.imprimirRecibo = async function (id) {
         ${r.referencia ? `<div>Referencia: ${esc(r.referencia)}</div>` : ''}
         ${r.factura ? `<div>Aplicado a factura: ${esc(r.factura)}</div>` : ''}
         <div>Categoría: ${esc(r.categoria)}</div>
+        <div>Moneda: ${esc(r.moneda)} (${esc(simbolo(r.moneda))})</div>
       </div>
     </div>
     <table><thead><tr><th>Concepto</th><th style="text-align:right;width:150px">Monto</th></tr></thead>
-      <tbody><tr><td>${esc(r.concepto)}</td><td style="text-align:right">${money(r.monto)}</td></tr></tbody></table>
+      <tbody><tr><td>${esc(r.concepto)}</td><td style="text-align:right">${money(r.monto, r.moneda)}</td></tr></tbody></table>
     <div style="display:flex;justify-content:flex-end">
       <table style="width:280px"><tr>
         <td style="font-size:14px;font-weight:700;border-top:2px solid #12203f">TOTAL RECIBIDO</td>
-        <td style="text-align:right;font-size:14px;font-weight:700;border-top:2px solid #12203f">${money(r.monto)}</td></tr></table></div>
+        <td style="text-align:right;font-size:14px;font-weight:700;border-top:2px solid #12203f">${money(r.monto, r.moneda)}</td></tr></table></div>
     ${r.notas ? `<div style="margin-top:10px"><b>Notas:</b> ${esc(r.notas)}</div>` : ''}
     <div class="pie-doc">Este recibo confirma el pago descrito. Conserve este documento como comprobante.</div>
     <div class="sello"><div>Recibido por (${esc(e.nombre)})</div><div>Entregado por</div></div>

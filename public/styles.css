@@ -69,6 +69,8 @@ tbody tr:hover{background:#f8fafd}
 .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tabla-scroll{overflow-x:auto}
 .tabla-scroll table{min-width:820px}
+.tabla-scroll.compacta table{min-width:0;width:100%}
+.tabla-scroll.media table{min-width:min(560px,100%)}
 .tabla-scroll td:first-child{white-space:nowrap}
 .vacio{text-align:center;color:var(--suave);padding:2rem 1rem}
 
@@ -97,6 +99,11 @@ dialog .pie{display:flex;justify-content:flex-end;gap:.55rem;padding:.85rem 1.1r
 .totales{margin-left:auto;width:min(320px,100%);font-variant-numeric:tabular-nums}
 .totales div{display:flex;justify-content:space-between;padding:.28rem 0}
 .totales .grande{border-top:2px solid var(--linea);margin-top:.3rem;padding-top:.5rem;font-size:1.15rem;font-weight:700}
+.totales{width:min(360px,100%)}
+.totales div{gap:.8rem}
+.totales div>span:first-child{white-space:nowrap}
+.totales div>b{text-align:right}
+.nw{white-space:nowrap}
 
 canvas{max-width:100%}
 .dos{display:grid;gap:1rem;grid-template-columns:1.6fr 1fr}

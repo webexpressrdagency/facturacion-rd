@@ -230,6 +230,15 @@ agregarColumna('documentos', 'token', "TEXT DEFAULT ''");
 agregarColumna('documentos', 'stock_aplicado', 'INTEGER NOT NULL DEFAULT 0');
 agregarColumna('ingresos', 'token', "TEXT DEFAULT ''");
 agregarColumna('empresa', 'url_publica', "TEXT DEFAULT ''");
+// Multimoneda: cada documento, cobro, gasto y artículo guarda su propia moneda.
+// Lo ya registrado se queda en la moneda que la empresa tenía configurada.
+const monedaBase = (() => {
+  try { return db.prepare('SELECT moneda FROM empresa WHERE id = 1').get()?.moneda || 'DOP'; }
+  catch { return 'DOP'; }
+})();
+for (const tabla of ['documentos', 'ingresos', 'gastos', 'productos']) {
+  agregarColumna(tabla, 'moneda', `TEXT NOT NULL DEFAULT '${monedaBase}'`);
+}
 
 // ---- semillas -------------------------------------------------------------
 function hashPassword(pass) {
@@ -288,4 +297,16 @@ function nuevoToken() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-module.exports = { db, hashPassword, verifyPassword, siguienteNumero, siguienteNCF, nuevoToken, DB_PATH, DATA_DIR };
+/* Monedas admitidas. Cada documento guarda la suya y no se convierte nada:
+   los totales se presentan separados por moneda. */
+const MONEDAS = {
+  DOP: { simbolo: 'RD$', nombre: 'Peso dominicano' },
+  USD: { simbolo: 'US$', nombre: 'Dólar estadounidense' },
+};
+const monedaValida = (m) => (MONEDAS[String(m || '').toUpperCase()] ? String(m).toUpperCase() : null);
+const simboloDe = (m) => (MONEDAS[m] ? MONEDAS[m].simbolo : m || '');
+
+module.exports = {
+  db, hashPassword, verifyPassword, siguienteNumero, siguienteNCF, nuevoToken,
+  MONEDAS, monedaValida, simboloDe, DB_PATH, DATA_DIR,
+};

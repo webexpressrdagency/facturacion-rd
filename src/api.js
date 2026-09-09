@@ -1,6 +1,7 @@
 'use strict';
 const crypto = require('node:crypto');
-const { db, hashPassword, verifyPassword, siguienteNumero, siguienteNCF, nuevoToken } = require('./db');
+const { db, hashPassword, verifyPassword, siguienteNumero, siguienteNCF, nuevoToken,
+  MONEDAS, monedaValida, simboloDe } = require('./db');
 const { pdfDocumento, pdfRecibo } = require('./plantillas');
 const correo = require('./correo');
 
@@ -54,6 +55,9 @@ const txt = (v) => (v === undefined || v === null ? '' : String(v));
 const hoy = () => new Date().toISOString().slice(0, 10);
 
 function empresa() { return db.prepare('SELECT * FROM empresa WHERE id = 1').get(); }
+
+/** Moneda pedida, o la predeterminada de la empresa si no viene o no es válida. */
+function moneda(valor) { return monedaValida(valor) || monedaValida(empresa().moneda) || 'DOP'; }
 
 function calcularDocumento(items, descuentoGlobal, tasaItbis) {
   let subtotal = 0, itbis = 0;
@@ -187,8 +191,9 @@ function aplicarStock(documentoId) {
 }
 
 function bajoMinimo() {
-  return db.prepare(`SELECT id, codigo, nombre, unidad, existencia, minimo, precio, costo FROM productos
-    WHERE inventario = 1 AND activo = 1 AND existencia <= minimo ORDER BY (existencia - minimo), nombre`).all();
+  return db.prepare(`SELECT id, codigo, nombre, unidad, existencia, minimo, precio, costo, moneda FROM productos
+    WHERE inventario = 1 AND activo = 1 AND existencia <= minimo ORDER BY (existencia - minimo), nombre`).all()
+    .map((x) => ({ ...x, simbolo: simboloDe(x.moneda) }));
 }
 
 // ------------------------------------------------------------------ CRUD gen
@@ -211,53 +216,68 @@ function rangoDefault(q) {
 
 function resumen(q) {
   const { desde, hasta } = rangoDefault(q);
-  const ing = db.prepare('SELECT COALESCE(SUM(monto),0) s, COUNT(*) c FROM ingresos WHERE fecha BETWEEN ? AND ?').get(desde, hasta);
-  const gas = db.prepare('SELECT COALESCE(SUM(monto),0) s, COUNT(*) c FROM gastos WHERE fecha BETWEEN ? AND ?').get(desde, hasta);
-  const fact = db.prepare(`SELECT COALESCE(SUM(total),0) s, COUNT(*) c FROM documentos
-      WHERE tipo='factura' AND estado <> 'anulada' AND estado <> 'borrador' AND fecha BETWEEN ? AND ?`).get(desde, hasta);
-  const porCobrar = db.prepare(`SELECT COALESCE(SUM(d.total - COALESCE((SELECT SUM(i.monto) FROM ingresos i WHERE i.documento_id = d.id),0)),0) s,
-      COUNT(*) c FROM documentos d WHERE d.tipo='factura' AND d.estado IN ('emitida','parcial')`).get();
-  const vencidas = db.prepare(`SELECT COUNT(*) c FROM documentos d WHERE d.tipo='factura' AND d.estado IN ('emitida','parcial')
-      AND d.vencimiento <> '' AND d.vencimiento < ?`).get(hoy());
-  const presup = db.prepare(`SELECT COALESCE(SUM(total),0) s, COUNT(*) c FROM documentos WHERE tipo='presupuesto' AND fecha BETWEEN ? AND ?`).get(desde, hasta);
-  const presupAprob = db.prepare(`SELECT COUNT(*) c FROM documentos WHERE tipo='presupuesto' AND estado='aprobado'`).get();
-  const itbisVentas = db.prepare(`SELECT COALESCE(SUM(itbis),0) s FROM documentos WHERE tipo='factura' AND estado NOT IN ('anulada','borrador') AND fecha BETWEEN ? AND ?`).get(desde, hasta);
-  const itbisCompras = db.prepare(`SELECT COALESCE(SUM(itbis),0) s FROM gastos WHERE deducible=1 AND fecha BETWEEN ? AND ?`).get(desde, hasta);
+  const uno = (sql, ...p) => db.prepare(sql).get(...p);
 
-  // series mensuales (12 meses hacia atrás desde 'hasta')
+  // Monedas con movimiento en el período, más la predeterminada de la empresa
+  const usadas = new Set([moneda(null)]);
+  for (const t of ['documentos', 'ingresos', 'gastos']) {
+    for (const f of db.prepare(`SELECT DISTINCT moneda FROM ${t}`).all()) if (f.moneda) usadas.add(f.moneda);
+  }
+  const monedas = [...usadas].filter((m) => MONEDAS[m]);
+
+  // 12 meses hacia atrás desde 'hasta'
   const meses = [];
   const base = new Date(hasta + 'T00:00:00');
   for (let i = 11; i >= 0; i--) {
     const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
     meses.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
   }
-  const serie = meses.map((m) => ({
-    mes: m,
-    ingresos: r2(db.prepare("SELECT COALESCE(SUM(monto),0) s FROM ingresos WHERE substr(fecha,1,7) = ?").get(m).s),
-    gastos: r2(db.prepare("SELECT COALESCE(SUM(monto),0) s FROM gastos WHERE substr(fecha,1,7) = ?").get(m).s),
-  }));
 
-  const gastosCat = db.prepare(`SELECT categoria, COALESCE(SUM(monto),0) total FROM gastos
-      WHERE fecha BETWEEN ? AND ? GROUP BY categoria ORDER BY total DESC LIMIT 10`).all(desde, hasta);
-  const topClientes = db.prepare(`SELECT COALESCE(c.nombre, d.cliente_nombre, 'Sin cliente') nombre, COALESCE(SUM(d.total),0) total
-      FROM documentos d LEFT JOIN contactos c ON c.id = d.contacto_id
-      WHERE d.tipo='factura' AND d.estado NOT IN ('anulada','borrador') AND d.fecha BETWEEN ? AND ?
-      GROUP BY nombre ORDER BY total DESC LIMIT 8`).all(desde, hasta);
+  /* Cada moneda se calcula por separado: no se convierte nada, así que los
+     totales de RD$ y US$ nunca se mezclan. */
+  const porMoneda = {};
+  for (const m of monedas) {
+    const ing = uno('SELECT COALESCE(SUM(monto),0) s, COUNT(*) c FROM ingresos WHERE moneda = ? AND fecha BETWEEN ? AND ?', m, desde, hasta);
+    const gas = uno('SELECT COALESCE(SUM(monto),0) s, COUNT(*) c FROM gastos WHERE moneda = ? AND fecha BETWEEN ? AND ?', m, desde, hasta);
+    const fact = uno(`SELECT COALESCE(SUM(total),0) s, COUNT(*) c FROM documentos WHERE tipo='factura'
+        AND estado NOT IN ('anulada','borrador') AND moneda = ? AND fecha BETWEEN ? AND ?`, m, desde, hasta);
+    const cobrar = uno(`SELECT COALESCE(SUM(d.total - COALESCE((SELECT SUM(i.monto) FROM ingresos i WHERE i.documento_id = d.id),0)),0) s,
+        COUNT(*) c FROM documentos d WHERE d.tipo='factura' AND d.estado IN ('emitida','parcial') AND d.moneda = ?`, m);
+    const vencidas = uno(`SELECT COUNT(*) c FROM documentos d WHERE d.tipo='factura' AND d.estado IN ('emitida','parcial')
+        AND d.moneda = ? AND d.vencimiento <> '' AND d.vencimiento < ?`, m, hoy());
+    const presup = uno(`SELECT COALESCE(SUM(total),0) s, COUNT(*) c FROM documentos WHERE tipo='presupuesto'
+        AND moneda = ? AND fecha BETWEEN ? AND ?`, m, desde, hasta);
+    const aprob = uno(`SELECT COUNT(*) c FROM documentos WHERE tipo='presupuesto' AND estado='aprobado' AND moneda = ?`, m);
+    const itbisV = uno(`SELECT COALESCE(SUM(itbis),0) s FROM documentos WHERE tipo='factura'
+        AND estado NOT IN ('anulada','borrador') AND moneda = ? AND fecha BETWEEN ? AND ?`, m, desde, hasta);
+    const itbisC = uno('SELECT COALESCE(SUM(itbis),0) s FROM gastos WHERE deducible=1 AND moneda = ? AND fecha BETWEEN ? AND ?', m, desde, hasta);
+    const inv = uno('SELECT COALESCE(SUM(existencia * costo),0) valor, COUNT(*) n FROM productos WHERE inventario = 1 AND activo = 1 AND moneda = ?', m);
 
-  const inv = db.prepare(`SELECT COALESCE(SUM(existencia * costo),0) valor, COUNT(*) n FROM productos WHERE inventario = 1 AND activo = 1`).get();
+    porMoneda[m] = {
+      moneda: m, simbolo: simboloDe(m),
+      ingresos: r2(ing.s), nIngresos: ing.c,
+      gastos: r2(gas.s), nGastos: gas.c,
+      balance: r2(ing.s - gas.s),
+      facturado: r2(fact.s), nFacturas: fact.c,
+      porCobrar: r2(cobrar.s), nPorCobrar: cobrar.c, nVencidas: vencidas.c,
+      presupuestado: r2(presup.s), nPresupuestos: presup.c, nAprobados: aprob.c,
+      itbisVentas: r2(itbisV.s), itbisCompras: r2(itbisC.s), itbisPagar: r2(itbisV.s - itbisC.s),
+      inventarioValor: r2(inv.valor), inventarioArticulos: inv.n,
+      serie: meses.map((mes) => ({
+        mes,
+        ingresos: r2(uno('SELECT COALESCE(SUM(monto),0) s FROM ingresos WHERE moneda = ? AND substr(fecha,1,7) = ?', m, mes).s),
+        gastos: r2(uno('SELECT COALESCE(SUM(monto),0) s FROM gastos WHERE moneda = ? AND substr(fecha,1,7) = ?', m, mes).s),
+      })),
+      gastosCat: db.prepare(`SELECT categoria, COALESCE(SUM(monto),0) total FROM gastos
+        WHERE moneda = ? AND fecha BETWEEN ? AND ? GROUP BY categoria ORDER BY total DESC LIMIT 10`).all(m, desde, hasta),
+      topClientes: db.prepare(`SELECT COALESCE(c.nombre, d.cliente_nombre, 'Sin cliente') nombre, COALESCE(SUM(d.total),0) total
+        FROM documentos d LEFT JOIN contactos c ON c.id = d.contacto_id
+        WHERE d.tipo='factura' AND d.estado NOT IN ('anulada','borrador') AND d.moneda = ? AND d.fecha BETWEEN ? AND ?
+        GROUP BY nombre ORDER BY total DESC LIMIT 8`).all(m, desde, hasta),
+    };
+  }
 
-  return {
-    desde, hasta,
-    inventarioValor: r2(inv.valor), inventarioArticulos: inv.n, bajoMinimo: bajoMinimo(),
-    ingresos: r2(ing.s), nIngresos: ing.c,
-    gastos: r2(gas.s), nGastos: gas.c,
-    balance: r2(ing.s - gas.s),
-    facturado: r2(fact.s), nFacturas: fact.c,
-    porCobrar: r2(porCobrar.s), nPorCobrar: porCobrar.c, nVencidas: vencidas.c,
-    presupuestado: r2(presup.s), nPresupuestos: presup.c, nAprobados: presupAprob.c,
-    itbisVentas: r2(itbisVentas.s), itbisCompras: r2(itbisCompras.s), itbisPagar: r2(itbisVentas.s - itbisCompras.s),
-    serie, gastosCat, topClientes,
-  };
+  return { desde, hasta, monedas, porMoneda, bajoMinimo: bajoMinimo() };
 }
 
 // ------------------------------------------------------------------ rutas
@@ -318,6 +338,11 @@ on('DELETE', '/api/usuarios/:id', (c) => {
   return { body: { ok: true } };
 });
 
+// ---- monedas admitidas
+on('GET', '/api/monedas', () => ({
+  body: Object.entries(MONEDAS).map(([codigo, m]) => ({ codigo, ...m })),
+}));
+
 // ---- empresa
 on('GET', '/api/empresa', () => ({ body: empresa() }));
 on('PUT', '/api/empresa', (c) => {
@@ -325,7 +350,7 @@ on('PUT', '/api/empresa', (c) => {
   db.prepare(`UPDATE empresa SET nombre=?, rnc=?, direccion=?, telefono=?, email=?, web=?, logo=?, moneda=?, simbolo=?,
     itbis_tasa=?, condiciones=?, validez_presupuesto=?, url_publica=? WHERE id = 1`).run(
     txt(b.nombre) || e.nombre, txt(b.rnc), txt(b.direccion), txt(b.telefono), txt(b.email), txt(b.web),
-    txt(b.logo), txt(b.moneda) || 'DOP', txt(b.simbolo) || 'RD$', num(b.itbis_tasa),
+    txt(b.logo), moneda(b.moneda), simboloDe(moneda(b.moneda)), num(b.itbis_tasa),
     txt(b.condiciones), Math.max(0, parseInt(b.validez_presupuesto, 10) || 15),
     txt(b.url_publica).replace(/\/+$/, ''));
   return { body: empresa() };
@@ -374,10 +399,10 @@ on('GET', '/api/productos', (c) => {
 on('POST', '/api/productos', (c) => {
   const b = c.body;
   if (!txt(b.nombre).trim()) return { status: 400, body: { error: 'El nombre es obligatorio' } };
-  const info = db.prepare(`INSERT INTO productos (codigo,nombre,descripcion,unidad,precio,costo,itbis,activo,inventario,existencia,minimo)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(txt(b.codigo), txt(b.nombre).trim(), txt(b.descripcion), txt(b.unidad) || 'ud',
+  const info = db.prepare(`INSERT INTO productos (codigo,nombre,descripcion,unidad,precio,costo,itbis,activo,inventario,existencia,minimo,moneda)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(txt(b.codigo), txt(b.nombre).trim(), txt(b.descripcion), txt(b.unidad) || 'ud',
     num(b.precio), num(b.costo), b.itbis === 0 ? 0 : 1, b.activo === 0 ? 0 : 1,
-    b.inventario ? 1 : 0, 0, num(b.minimo));
+    b.inventario ? 1 : 0, 0, num(b.minimo), moneda(b.moneda));
   const id = Number(info.lastInsertRowid);
   if (b.inventario && num(b.existencia) !== 0) {
     registrarMovimiento({ producto_id: id, tipo: 'entrada', cantidad: num(b.existencia), costo: num(b.costo), motivo: 'Existencia inicial' });
@@ -389,9 +414,9 @@ on('PUT', '/api/productos/:id', (c) => {
   const prev = db.prepare('SELECT * FROM productos WHERE id = ?').get(id);
   if (!prev) return { status: 404, body: { error: 'Artículo no encontrado' } };
   db.prepare(`UPDATE productos SET codigo=?, nombre=?, descripcion=?, unidad=?, precio=?, costo=?, itbis=?, activo=?,
-    inventario=?, minimo=? WHERE id=?`)
+    inventario=?, minimo=?, moneda=? WHERE id=?`)
     .run(txt(b.codigo), txt(b.nombre).trim(), txt(b.descripcion), txt(b.unidad) || 'ud', num(b.precio), num(b.costo),
-      b.itbis === 0 ? 0 : 1, b.activo === 0 ? 0 : 1, b.inventario ? 1 : 0, num(b.minimo), id);
+      b.itbis === 0 ? 0 : 1, b.activo === 0 ? 0 : 1, b.inventario ? 1 : 0, num(b.minimo), moneda(b.moneda), id);
   // Si acaba de activar el inventario, la existencia indicada entra como movimiento inicial
   if (b.inventario && !prev.inventario && num(b.existencia) !== 0) {
     registrarMovimiento({ producto_id: id, tipo: 'entrada', cantidad: num(b.existencia), costo: num(b.costo), motivo: 'Existencia inicial' });
@@ -401,14 +426,15 @@ on('PUT', '/api/productos/:id', (c) => {
 
 // ---- inventario
 on('GET', '/api/inventario', (c) => {
-  let sql = `SELECT id, codigo, nombre, unidad, existencia, minimo, costo, precio, activo,
+  let sql = `SELECT id, codigo, nombre, unidad, existencia, minimo, costo, precio, activo, moneda,
     ROUND(existencia * costo, 2) valor FROM productos WHERE inventario = 1`;
   const p = [];
   if (c.query.q) { sql += ' AND (nombre LIKE ? OR codigo LIKE ?)'; const t = `%${c.query.q}%`; p.push(t, t); }
   if (c.query.bajo === '1') sql += ' AND existencia <= minimo';
-  const filas = db.prepare(sql + ' ORDER BY nombre').all(...p);
-  const valor = r2(filas.reduce((a, x) => a + x.valor, 0));
-  return { body: { filas, valor, bajos: filas.filter((x) => x.existencia <= x.minimo).length } };
+  const filas = db.prepare(sql + ' ORDER BY nombre').all(...p).map((x) => ({ ...x, simbolo: simboloDe(x.moneda) }));
+  const valorPorMoneda = {};
+  for (const f of filas) valorPorMoneda[f.moneda] = r2((valorPorMoneda[f.moneda] || 0) + f.valor);
+  return { body: { filas, valorPorMoneda, bajos: filas.filter((x) => x.existencia <= x.minimo).length } };
 });
 
 on('GET', '/api/inventario/:id/movimientos', (c) => {
@@ -486,6 +512,18 @@ function guardarDocumento(c, id) {
   if (!items.length) return { status: 400, body: { error: 'Agregue al menos una línea al documento' } };
   const calc = calcularDocumento(items, b.descuento, num(e.itbis_tasa));
 
+  // Moneda del documento. Si ya tiene cobros registrados no se puede cambiar,
+  // porque el balance quedaría mezclando monedas.
+  let mon = moneda(b.moneda);
+  if (id) {
+    const prev = db.prepare('SELECT moneda FROM documentos WHERE id = ?').get(id);
+    const cobros = db.prepare('SELECT COUNT(*) n FROM ingresos WHERE documento_id = ?').get(id).n;
+    if (prev && cobros && mon !== prev.moneda) {
+      return { status: 400, body: { error: `No se puede cambiar la moneda: la factura ya tiene cobros en ${simboloDe(prev.moneda)}.` } };
+    }
+    if (prev && !b.moneda) mon = prev.moneda;
+  }
+
   let contactoId = b.contacto_id ? Number(b.contacto_id) : null;
   let cliente = contactoId ? db.prepare('SELECT * FROM contactos WHERE id = ?').get(contactoId) : null;
   if (!cliente && txt(b.cliente_nombre).trim() && b.crear_cliente) {
@@ -522,17 +560,17 @@ function guardarDocumento(c, id) {
   if (!id) {
     const numero = txt(b.numero) || siguienteNumero(tipo, tipo === 'factura' ? 'FAC' : 'PRE');
     const info = db.prepare(`INSERT INTO documentos (tipo,numero,ncf,ncf_tipo,contacto_id,cliente_nombre,cliente_rnc,fecha,
-      vencimiento,estado,subtotal,descuento,itbis,total,notas,condiciones,origen_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      vencimiento,estado,subtotal,descuento,itbis,total,notas,condiciones,origen_id,moneda) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(tipo, numero, ncf, ncfTipo, contactoId, nombreCli, rncCli, fecha, venc, estado,
         calc.subtotal, calc.descuento, calc.itbis, calc.total, txt(b.notas), txt(b.condiciones) || e.condiciones,
-        b.origen_id ? Number(b.origen_id) : null);
+        b.origen_id ? Number(b.origen_id) : null, mon);
     id = Number(info.lastInsertRowid);
   } else {
     revertirStock(id);   // devolvemos al inventario lo anterior antes de reescribir las líneas
     db.prepare(`UPDATE documentos SET numero=?, ncf=?, ncf_tipo=?, contacto_id=?, cliente_nombre=?, cliente_rnc=?, fecha=?,
-      vencimiento=?, estado=?, subtotal=?, descuento=?, itbis=?, total=?, notas=?, condiciones=? WHERE id=?`)
+      vencimiento=?, estado=?, subtotal=?, descuento=?, itbis=?, total=?, notas=?, condiciones=?, moneda=? WHERE id=?`)
       .run(txt(b.numero), ncf, ncfTipo, contactoId, nombreCli, rncCli, fecha, venc, estado,
-        calc.subtotal, calc.descuento, calc.itbis, calc.total, txt(b.notas), txt(b.condiciones), id);
+        calc.subtotal, calc.descuento, calc.itbis, calc.total, txt(b.notas), txt(b.condiciones), mon, id);
     db.prepare('DELETE FROM documento_items WHERE documento_id = ?').run(id);
   }
 
@@ -620,19 +658,27 @@ on('POST', '/api/ingresos', (c) => {
   let contactoId = b.contacto_id ? Number(b.contacto_id) : null;
   let docId = b.documento_id ? Number(b.documento_id) : null;
   let concepto = txt(b.concepto).trim();
+  let mon = moneda(b.moneda);
   if (docId) {
     const d = docCompleto(docId);
     if (!d) return { status: 400, body: { error: 'La factura indicada no existe' } };
     if (d.estado === 'anulada') return { status: 400, body: { error: 'La factura está anulada' } };
-    if (monto - d.balance > 0.009) return { status: 400, body: { error: `El pago excede el balance pendiente (${d.balance.toFixed(2)})` } };
+    // el cobro va siempre en la moneda de la factura
+    if (b.moneda && moneda(b.moneda) !== d.moneda) {
+      return { status: 400, body: { error: `La factura ${d.numero} está en ${simboloDe(d.moneda)}; el cobro debe registrarse en esa misma moneda.` } };
+    }
+    mon = d.moneda;
+    if (monto - d.balance > 0.009) {
+      return { status: 400, body: { error: `El pago excede el balance pendiente (${simboloDe(mon)} ${d.balance.toFixed(2)})` } };
+    }
     if (!contactoId) contactoId = d.contacto_id;
     if (!concepto) concepto = `Pago factura ${d.numero}`;
   }
   if (!concepto) return { status: 400, body: { error: 'Indique un concepto' } };
   const recibo = siguienteNumero('recibo', 'REC');
-  const info = db.prepare(`INSERT INTO ingresos (recibo,fecha,concepto,categoria,contacto_id,documento_id,monto,metodo,referencia,notas)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`).run(recibo, txt(b.fecha) || hoy(), concepto, txt(b.categoria) || 'Ventas',
-    contactoId, docId, monto, txt(b.metodo) || 'Efectivo', txt(b.referencia), txt(b.notas));
+  const info = db.prepare(`INSERT INTO ingresos (recibo,fecha,concepto,categoria,contacto_id,documento_id,monto,metodo,referencia,notas,moneda)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(recibo, txt(b.fecha) || hoy(), concepto, txt(b.categoria) || 'Ventas',
+    contactoId, docId, monto, txt(b.metodo) || 'Efectivo', txt(b.referencia), txt(b.notas), mon);
   if (docId) estadoAuto(docId);
   return { body: db.prepare('SELECT * FROM ingresos WHERE id = ?').get(Number(info.lastInsertRowid)) };
 });
@@ -641,9 +687,11 @@ on('PUT', '/api/ingresos/:id', (c) => {
   const b = c.body, id = Number(c.params.id);
   const prev = db.prepare('SELECT * FROM ingresos WHERE id = ?').get(id);
   if (!prev) return { status: 404, body: { error: 'No encontrado' } };
-  db.prepare(`UPDATE ingresos SET fecha=?, concepto=?, categoria=?, contacto_id=?, monto=?, metodo=?, referencia=?, notas=? WHERE id=?`)
+  // la moneda de un cobro aplicado a una factura no se puede cambiar
+  const monEdit = prev.documento_id ? prev.moneda : moneda(b.moneda !== undefined ? b.moneda : prev.moneda);
+  db.prepare(`UPDATE ingresos SET fecha=?, concepto=?, categoria=?, contacto_id=?, monto=?, metodo=?, referencia=?, notas=?, moneda=? WHERE id=?`)
     .run(txt(b.fecha) || prev.fecha, txt(b.concepto) || prev.concepto, txt(b.categoria) || 'Ventas',
-      b.contacto_id ? Number(b.contacto_id) : null, r2(b.monto), txt(b.metodo), txt(b.referencia), txt(b.notas), id);
+      b.contacto_id ? Number(b.contacto_id) : null, r2(b.monto), txt(b.metodo), txt(b.referencia), txt(b.notas), monEdit, id);
   if (prev.documento_id) estadoAuto(prev.documento_id);
   return { body: db.prepare('SELECT * FROM ingresos WHERE id = ?').get(id) };
 });
@@ -673,10 +721,10 @@ on('POST', '/api/gastos', (c) => {
   if (!txt(b.concepto).trim()) return { status: 400, body: { error: 'Indique un concepto' } };
   const subtotal = r2(b.subtotal), itbis = r2(b.itbis);
   const total = b.monto !== undefined && num(b.monto) > 0 ? r2(b.monto) : r2(subtotal + itbis);
-  const info = db.prepare(`INSERT INTO gastos (fecha,concepto,categoria,contacto_id,subtotal,itbis,monto,metodo,ncf,comprobante,deducible,notas)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(txt(b.fecha) || hoy(), txt(b.concepto).trim(), txt(b.categoria) || 'General',
+  const info = db.prepare(`INSERT INTO gastos (fecha,concepto,categoria,contacto_id,subtotal,itbis,monto,metodo,ncf,comprobante,deducible,notas,moneda)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(txt(b.fecha) || hoy(), txt(b.concepto).trim(), txt(b.categoria) || 'General',
     b.contacto_id ? Number(b.contacto_id) : null, subtotal, itbis, total, txt(b.metodo) || 'Efectivo',
-    txt(b.ncf), txt(b.comprobante), b.deducible === 0 ? 0 : 1, txt(b.notas));
+    txt(b.ncf), txt(b.comprobante), b.deducible === 0 ? 0 : 1, txt(b.notas), moneda(b.moneda));
   return { body: db.prepare('SELECT * FROM gastos WHERE id = ?').get(Number(info.lastInsertRowid)) };
 });
 
@@ -685,9 +733,9 @@ on('PUT', '/api/gastos/:id', (c) => {
   const subtotal = r2(b.subtotal), itbis = r2(b.itbis);
   const total = b.monto !== undefined && num(b.monto) > 0 ? r2(b.monto) : r2(subtotal + itbis);
   db.prepare(`UPDATE gastos SET fecha=?, concepto=?, categoria=?, contacto_id=?, subtotal=?, itbis=?, monto=?, metodo=?,
-    ncf=?, comprobante=?, deducible=?, notas=? WHERE id=?`).run(txt(b.fecha), txt(b.concepto).trim(), txt(b.categoria) || 'General',
+    ncf=?, comprobante=?, deducible=?, notas=?, moneda=? WHERE id=?`).run(txt(b.fecha), txt(b.concepto).trim(), txt(b.categoria) || 'General',
     b.contacto_id ? Number(b.contacto_id) : null, subtotal, itbis, total, txt(b.metodo), txt(b.ncf), txt(b.comprobante),
-    b.deducible === 0 ? 0 : 1, txt(b.notas), id);
+    b.deducible === 0 ? 0 : 1, txt(b.notas), moneda(b.moneda), id);
   return { body: db.prepare('SELECT * FROM gastos WHERE id = ?').get(id) };
 });
 
@@ -717,16 +765,16 @@ function datosCompartir(tipo, id, ctx) {
   const e = empresa();
   const base = (e.url_publica || ctx.origen || '').replace(/\/+$/, '');
   const enlace = `${base}/p/${token}`;
-  let titulo, total, tel, nombre, email;
+  let titulo, total, tel, nombre, email, mon;
   if (tipo === 'recibo') {
     const r = reciboCompleto(id);
-    titulo = `Recibo ${r.recibo}`; total = r.monto; tel = r.cliente_telefono; nombre = r.cliente; email = r.cliente_email;
+    titulo = `Recibo ${r.recibo}`; total = r.monto; tel = r.cliente_telefono; nombre = r.cliente; email = r.cliente_email; mon = r.moneda;
   } else {
     const d = docCompleto(id);
     titulo = `${d.tipo === 'factura' ? 'Factura' : 'Presupuesto'} ${d.numero}`;
-    total = d.total; tel = d.cliente?.telefono; nombre = d.cliente?.nombre || d.cliente_nombre; email = d.cliente?.email;
+    total = d.total; tel = d.cliente?.telefono; nombre = d.cliente?.nombre || d.cliente_nombre; email = d.cliente?.email; mon = d.moneda;
   }
-  const monto = `${e.simbolo} ${r2(total).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+  const monto = `${simboloDe(mon)} ${r2(total).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
   const etiqueta = titulo.replace(/^(\w+)/, (w) => w.toLowerCase());   // "factura FAC-2026-00007"
   const mensaje = `Hola${nombre ? ' ' + nombre : ''}, le comparto su ${etiqueta} por ${monto} de ${e.nombre}.\n\n${enlace}`;
   const numero = telefonoWhatsApp(tel);
@@ -789,7 +837,8 @@ function paginaError() {
 
 function paginaVista(p, token, base) {
   const { e } = p;
-  const dinero = (v) => `${e.simbolo} ${r2(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const mon = p.datos.moneda || e.moneda;
+  const dinero = (v) => `${simboloDe(mon)} ${r2(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const fecha = (f) => (f ? String(f).split('-').reverse().join('/') : '—');
   const esRecibo = p.tipo === 'recibo';
   const d = p.datos;
@@ -854,7 +903,7 @@ td{padding:8px 10px;border-bottom:1px solid #e6ebf4}
     </div>
     <div class="caja"><b class="et">${esRecibo ? 'Detalle del pago' : 'Resumen'}</b>
       ${esRecibo ? `<div>Método: ${escHtml(d.metodo)}</div>${d.factura ? `<div>Factura: ${escHtml(d.factura)}</div>` : ''}`
-      : `<div>Estado: ${escHtml(d.estado)}</div><div>Moneda: ${escHtml(e.moneda)}</div>`}
+      : `<div>Estado: ${escHtml(d.estado)}</div><div>Moneda: ${escHtml(mon)} (${escHtml(simboloDe(mon))})</div>`}
     </div>
   </div>
   <table>
@@ -929,7 +978,7 @@ async function enviarCorreo(tipo, id, body, ctx) {
   const vars = {
     numero: esRecibo ? datos.recibo : datos.numero,
     cliente: (esRecibo ? datos.cliente : (datos.cliente?.nombre || datos.cliente_nombre)) || 'cliente',
-    total: `${e.simbolo} ${r2(esRecibo ? datos.monto : datos.total).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+    total: `${simboloDe(datos.moneda)} ${r2(esRecibo ? datos.monto : datos.total).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
     empresa: e.nombre, fecha: datos.fecha, enlace: comp.enlace,
   };
   const asunto = txt(body.asunto) || plantilla(cfg.asunto_factura, vars);
@@ -992,36 +1041,50 @@ on('GET', '/api/envios', (c) => {
 on('GET', '/api/reportes/resumen', (c) => ({ body: resumen(c.query) }));
 
 on('GET', '/api/reportes/cuentas-por-cobrar', () => {
-  const rows = db.prepare(`SELECT d.id, d.numero, d.ncf, d.fecha, d.vencimiento, d.total,
+  const rows = db.prepare(`SELECT d.id, d.numero, d.ncf, d.fecha, d.vencimiento, d.total, d.moneda,
     COALESCE((SELECT SUM(i.monto) FROM ingresos i WHERE i.documento_id = d.id),0) pagado,
     COALESCE(c.nombre, d.cliente_nombre) cliente FROM documentos d LEFT JOIN contactos c ON c.id = d.contacto_id
-    WHERE d.tipo='factura' AND d.estado IN ('emitida','parcial') ORDER BY d.vencimiento`).all();
+    WHERE d.tipo='factura' AND d.estado IN ('emitida','parcial') ORDER BY d.moneda, d.vencimiento`).all();
   const t = hoy();
+  // Solo lo que realmente queda por cobrar: una factura saldada no es una cuenta por cobrar.
   return { body: rows.map((r) => ({ ...r, balance: r2(r.total - r.pagado), vencida: r.vencimiento && r.vencimiento < t ? 1 : 0,
-    dias: r.vencimiento ? Math.round((new Date(t) - new Date(r.vencimiento)) / 86400000) : 0 })) };
+    dias: r.vencimiento ? Math.round((new Date(t) - new Date(r.vencimiento)) / 86400000) : 0 }))
+    .filter((r) => r.balance > 0.009) };
 });
 
 on('GET', '/api/reportes/itbis', (c) => {
   const { desde, hasta } = rangoDefault(c.query);
-  const ventas = db.prepare(`SELECT substr(fecha,1,7) mes, COALESCE(SUM(subtotal - descuento),0) base, COALESCE(SUM(itbis),0) itbis
+  const ventas = db.prepare(`SELECT moneda, substr(fecha,1,7) mes, COALESCE(SUM(subtotal - descuento),0) base, COALESCE(SUM(itbis),0) itbis
     FROM documentos WHERE tipo='factura' AND estado NOT IN ('anulada','borrador') AND fecha BETWEEN ? AND ?
-    GROUP BY mes ORDER BY mes`).all(desde, hasta);
-  const compras = db.prepare(`SELECT substr(fecha,1,7) mes, COALESCE(SUM(subtotal),0) base, COALESCE(SUM(itbis),0) itbis
-    FROM gastos WHERE deducible=1 AND fecha BETWEEN ? AND ? GROUP BY mes ORDER BY mes`).all(desde, hasta);
-  const meses = [...new Set([...ventas.map((v) => v.mes), ...compras.map((c2) => c2.mes)])].sort();
-  return { body: meses.map((m) => {
-    const v = ventas.find((x) => x.mes === m) || { base: 0, itbis: 0 };
-    const co = compras.find((x) => x.mes === m) || { base: 0, itbis: 0 };
-    return { mes: m, ventas: r2(v.base), itbisVentas: r2(v.itbis), compras: r2(co.base), itbisCompras: r2(co.itbis), aPagar: r2(v.itbis - co.itbis) };
+    GROUP BY moneda, mes ORDER BY moneda, mes`).all(desde, hasta);
+  const compras = db.prepare(`SELECT moneda, substr(fecha,1,7) mes, COALESCE(SUM(subtotal),0) base, COALESCE(SUM(itbis),0) itbis
+    FROM gastos WHERE deducible=1 AND fecha BETWEEN ? AND ? GROUP BY moneda, mes ORDER BY moneda, mes`).all(desde, hasta);
+  const claves = [...new Set([...ventas, ...compras].map((x) => `${x.moneda}|${x.mes}`))].sort();
+  return { body: claves.map((k) => {
+    const [mon, m] = k.split('|');
+    const v = ventas.find((x) => x.moneda === mon && x.mes === m) || { base: 0, itbis: 0 };
+    const co = compras.find((x) => x.moneda === mon && x.mes === m) || { base: 0, itbis: 0 };
+    return { moneda: mon, simbolo: simboloDe(mon), mes: m, ventas: r2(v.base), itbisVentas: r2(v.itbis),
+      compras: r2(co.base), itbisCompras: r2(co.itbis), aPagar: r2(v.itbis - co.itbis) };
   }) };
 });
 
 on('GET', '/api/reportes/estado', (c) => {
   const { desde, hasta } = rangoDefault(c.query);
-  const ing = db.prepare('SELECT categoria, COALESCE(SUM(monto),0) total FROM ingresos WHERE fecha BETWEEN ? AND ? GROUP BY categoria ORDER BY total DESC').all(desde, hasta);
-  const gas = db.prepare('SELECT categoria, COALESCE(SUM(monto),0) total FROM gastos WHERE fecha BETWEEN ? AND ? GROUP BY categoria ORDER BY total DESC').all(desde, hasta);
-  const ti = r2(ing.reduce((a, x) => a + x.total, 0)), tg = r2(gas.reduce((a, x) => a + x.total, 0));
-  return { body: { desde, hasta, ingresos: ing, gastos: gas, totalIngresos: ti, totalGastos: tg, utilidad: r2(ti - tg) } };
+  const monedas = [...new Set([
+    ...db.prepare('SELECT DISTINCT moneda m FROM ingresos WHERE fecha BETWEEN ? AND ?').all(desde, hasta).map((x) => x.m),
+    ...db.prepare('SELECT DISTINCT moneda m FROM gastos WHERE fecha BETWEEN ? AND ?').all(desde, hasta).map((x) => x.m),
+    moneda(null),
+  ])].filter((m) => MONEDAS[m]);
+  const bloques = monedas.map((m) => {
+    const ing = db.prepare(`SELECT categoria, COALESCE(SUM(monto),0) total FROM ingresos
+      WHERE moneda = ? AND fecha BETWEEN ? AND ? GROUP BY categoria ORDER BY total DESC`).all(m, desde, hasta);
+    const gas = db.prepare(`SELECT categoria, COALESCE(SUM(monto),0) total FROM gastos
+      WHERE moneda = ? AND fecha BETWEEN ? AND ? GROUP BY categoria ORDER BY total DESC`).all(m, desde, hasta);
+    const ti = r2(ing.reduce((a, x) => a + x.total, 0)), tg = r2(gas.reduce((a, x) => a + x.total, 0));
+    return { moneda: m, simbolo: simboloDe(m), ingresos: ing, gastos: gas, totalIngresos: ti, totalGastos: tg, utilidad: r2(ti - tg) };
+  });
+  return { body: { desde, hasta, monedas, bloques } };
 });
 
 // exportación CSV
@@ -1035,17 +1098,17 @@ on('GET', '/api/export/:tabla', (c) => {
   let rows = [], cols = [];
   if (t === 'facturas' || t === 'presupuestos') {
     rows = db.prepare(`SELECT d.numero, d.ncf, d.fecha, d.vencimiento, COALESCE(c.nombre,d.cliente_nombre) cliente,
-      d.cliente_rnc, d.subtotal, d.descuento, d.itbis, d.total, d.estado FROM documentos d
+      d.cliente_rnc, d.moneda, d.subtotal, d.descuento, d.itbis, d.total, d.estado FROM documentos d
       LEFT JOIN contactos c ON c.id=d.contacto_id WHERE d.tipo = ? ORDER BY d.fecha`).all(t === 'facturas' ? 'factura' : 'presupuesto');
-    cols = ['numero', 'ncf', 'fecha', 'vencimiento', 'cliente', 'cliente_rnc', 'subtotal', 'descuento', 'itbis', 'total', 'estado'];
+    cols = ['numero', 'ncf', 'fecha', 'vencimiento', 'cliente', 'cliente_rnc', 'moneda', 'subtotal', 'descuento', 'itbis', 'total', 'estado'];
   } else if (t === 'ingresos') {
-    rows = db.prepare(`SELECT i.recibo, i.fecha, i.concepto, i.categoria, c.nombre cliente, d.numero factura, i.monto, i.metodo, i.referencia
+    rows = db.prepare(`SELECT i.recibo, i.fecha, i.concepto, i.categoria, c.nombre cliente, d.numero factura, i.moneda, i.monto, i.metodo, i.referencia
       FROM ingresos i LEFT JOIN contactos c ON c.id=i.contacto_id LEFT JOIN documentos d ON d.id=i.documento_id ORDER BY i.fecha`).all();
-    cols = ['recibo', 'fecha', 'concepto', 'categoria', 'cliente', 'factura', 'monto', 'metodo', 'referencia'];
+    cols = ['recibo', 'fecha', 'concepto', 'categoria', 'cliente', 'factura', 'moneda', 'monto', 'metodo', 'referencia'];
   } else if (t === 'gastos') {
-    rows = db.prepare(`SELECT g.fecha, g.concepto, g.categoria, c.nombre proveedor, g.subtotal, g.itbis, g.monto, g.metodo, g.ncf, g.deducible
+    rows = db.prepare(`SELECT g.fecha, g.concepto, g.categoria, c.nombre proveedor, g.moneda, g.subtotal, g.itbis, g.monto, g.metodo, g.ncf, g.deducible
       FROM gastos g LEFT JOIN contactos c ON c.id=g.contacto_id ORDER BY g.fecha`).all();
-    cols = ['fecha', 'concepto', 'categoria', 'proveedor', 'subtotal', 'itbis', 'monto', 'metodo', 'ncf', 'deducible'];
+    cols = ['fecha', 'concepto', 'categoria', 'proveedor', 'moneda', 'subtotal', 'itbis', 'monto', 'metodo', 'ncf', 'deducible'];
   } else if (t === 'clientes' || t === 'proveedores') {
     rows = db.prepare('SELECT nombre, rnc, contacto, telefono, email, direccion, activo FROM contactos WHERE tipo = ? ORDER BY nombre')
       .all(t === 'clientes' ? 'cliente' : 'proveedor');

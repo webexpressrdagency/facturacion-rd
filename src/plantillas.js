@@ -11,9 +11,14 @@ const ANCHO_UTIL = 612 - M * 2;
 
 const fmtFecha = (f) => (f ? String(f).split('-').reverse().join('/') : '—');
 
-function dinero(e, v) {
+const SIMBOLOS = { DOP: 'RD$', USD: 'US$' };
+
+/* El importe se muestra siempre con la moneda del documento, no con la
+   predeterminada de la empresa: una factura en US$ se imprime en US$. */
+function dinero(e, v, mon) {
   const n = Math.round((Number(v) || 0) * 100) / 100;
-  return `${e.simbolo || 'RD$'} ${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const simbolo = SIMBOLOS[mon || e.moneda] || e.simbolo || 'RD$';
+  return `${simbolo} ${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function cabecera(pag, e, titulo, derecha, imagenes) {
@@ -62,7 +67,7 @@ function bloques(pag, y, izq, der) {
   return y + alto + 16;
 }
 
-function tablaItems(pag, y, e, items) {
+function tablaItems(pag, y, e, items, mon) {
   const cols = [M, M + 250, M + 322, M + 400, M + 432, 612 - M];
   pag.rect(M, y, ANCHO_UTIL, 18, OSC);
   const th = (t, x, align) => pag.texto(t, x, y + 12.5, { tam: 7.5, bold: true, color: '#ffffff', align });
@@ -78,9 +83,9 @@ function tablaItems(pag, y, e, items) {
     const alto = Math.max(20, 8 + lineas.length * 11);
     lineas.forEach((l, i) => pag.texto(l, cols[0] + 8, y + 13 + i * 11, { tam: 8.8 }));
     pag.texto(String(it.cantidad), cols[2] - 8, y + 13, { tam: 8.8, align: 'right' });
-    pag.texto(dinero(e, it.precio), cols[3] - 8, y + 13, { tam: 8.8, align: 'right' });
+    pag.texto(dinero(e, it.precio, mon), cols[3] - 8, y + 13, { tam: 8.8, align: 'right' });
     pag.texto(it.descuento ? `${it.descuento}%` : '—', cols[4] - 8, y + 13, { tam: 8.8, align: 'right' });
-    pag.texto(dinero(e, it.importe), cols[5] - 8, y + 13, { tam: 8.8, align: 'right' });
+    pag.texto(dinero(e, it.importe, mon), cols[5] - 8, y + 13, { tam: 8.8, align: 'right' });
     y += alto;
     pag.linea(M, y, 612 - M, y, '#e2e7f0');
   }
@@ -130,16 +135,17 @@ function pdfDocumento(d, e) {
   if (cli.telefono) lineasCli.push(`Tel.: ${cli.telefono}`);
   if (cli.email) lineasCli.push(cli.email);
 
-  const lineasRes = [`Estado: ${d.estado}`, `Moneda: ${e.moneda}`];
-  if (esFactura) { lineasRes.push(`Pagado: ${dinero(e, d.pagado)}`); lineasRes.push(`Balance: ${dinero(e, d.balance)}`); }
+  const mon = d.moneda || e.moneda;
+  const lineasRes = [`Estado: ${d.estado}`, `Moneda: ${mon} (${SIMBOLOS[mon] || ''})`];
+  if (esFactura) { lineasRes.push(`Pagado: ${dinero(e, d.pagado, mon)}`); lineasRes.push(`Balance: ${dinero(e, d.balance, mon)}`); }
 
   y = bloques(pag, y, { titulo: 'Cliente', lineas: lineasCli }, { titulo: 'Resumen', lineas: lineasRes });
-  y = tablaItems(pag, y, e, d.items);
+  y = tablaItems(pag, y, e, d.items, mon);
 
-  const filas = [['Subtotal', dinero(e, d.subtotal)]];
-  if (d.descuento) filas.push(['Descuento', `- ${dinero(e, d.descuento)}`]);
-  filas.push([`ITBIS (${e.itbis_tasa}%)`, dinero(e, d.itbis)]);
-  filas.push(['TOTAL', dinero(e, d.total), { grande: true, raya: true }]);
+  const filas = [['Subtotal', dinero(e, d.subtotal, mon)]];
+  if (d.descuento) filas.push(['Descuento', `- ${dinero(e, d.descuento, mon)}`]);
+  filas.push([`ITBIS (${e.itbis_tasa}%)`, dinero(e, d.itbis, mon)]);
+  filas.push(['TOTAL', dinero(e, d.total, mon), { grande: true, raya: true }]);
   y = totales(pag, y, e, filas) + 10;
 
   if (d.notas) y = pag.parrafo(`Notas: ${d.notas}`, M, y, ANCHO_UTIL, { tam: 8.5, color: '#333', maxLineas: 4 }) + 8;
@@ -156,7 +162,8 @@ function pdfRecibo(r, e) {
   const derecha = [['No.', r.recibo], ['Fecha:', fmtFecha(r.fecha)]];
   let y = cabecera(pag, e, 'RECIBO DE INGRESO', derecha, imagenes);
 
-  pag.texto(dinero(e, r.monto), 612 - M, y - 2, { tam: 16, bold: true, color: OSC, align: 'right' });
+  const mon = r.moneda || e.moneda;
+  pag.texto(dinero(e, r.monto, mon), 612 - M, y - 2, { tam: 16, bold: true, color: OSC, align: 'right' });
   y += 14;
 
   const lineasCli = [r.cliente || '—'];
@@ -167,6 +174,7 @@ function pdfRecibo(r, e) {
   if (r.referencia) lineasPago.push(`Referencia: ${r.referencia}`);
   if (r.factura) lineasPago.push(`Aplicado a factura: ${r.factura}`);
   lineasPago.push(`Categoría: ${r.categoria}`);
+  lineasPago.push(`Moneda: ${mon} (${SIMBOLOS[mon] || ''})`);
 
   y = bloques(pag, y, { titulo: 'Recibido de', lineas: lineasCli }, { titulo: 'Detalle del pago', lineas: lineasPago });
 
@@ -176,12 +184,12 @@ function pdfRecibo(r, e) {
   y += 18;
   const lineas = envolver(r.concepto, 9, false, 360);
   lineas.forEach((l, i) => pag.texto(l, M + 8, y + 14 + i * 11, { tam: 9 }));
-  pag.texto(dinero(e, r.monto), 612 - M - 8, y + 14, { tam: 9, align: 'right' });
+  pag.texto(dinero(e, r.monto, mon), 612 - M - 8, y + 14, { tam: 9, align: 'right' });
   y += Math.max(22, 10 + lineas.length * 11);
   pag.linea(M, y, 612 - M, y, '#e2e7f0');
   y += 12;
 
-  y = totales(pag, y, e, [['TOTAL RECIBIDO', dinero(e, r.monto), { grande: true, raya: true }]]) + 10;
+  y = totales(pag, y, e, [['TOTAL RECIBIDO', dinero(e, r.monto, mon), { grande: true, raya: true }]]) + 10;
   if (r.notas) y = pag.parrafo(`Notas: ${r.notas}`, M, y, ANCHO_UTIL, { tam: 8.5, color: '#333', maxLineas: 3 }) + 8;
 
   pie(pag, Math.min(Math.max(y, 640), 690),

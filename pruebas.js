@@ -17,6 +17,8 @@ async function req(metodo, ruta, body) {
   return { status: res.status, data };
 }
 
+const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
 function check(nombre, cond, extra = '') {
   if (cond) { ok++; console.log('  ✓', nombre); }
   else { fallos++; console.log('  ✗', nombre, extra); }
@@ -111,15 +113,16 @@ function check(nombre, cond, extra = '') {
 
   console.log('\n== Reportes ==');
   const r = (await req('GET', '/api/reportes/resumen?desde=2026-01-01&hasta=2026-12-31')).data;
-  check('suma ingresos', r.ingresos === 18700, `= ${r.ingresos}`);
-  check('suma gastos', r.gastos === 29500, `= ${r.gastos}`);
-  check('calcula utilidad', r.balance === -10800, `= ${r.balance}`);
-  check('ITBIS de compras deducible', r.itbisCompras === 4500, `= ${r.itbisCompras}`);
-  check('serie de 12 meses', r.serie.length === 12);
+  const rd = r.porMoneda.DOP;
+  check('suma ingresos en RD$', rd.ingresos === 18700, `= ${rd.ingresos}`);
+  check('suma gastos en RD$', rd.gastos === 29500, `= ${rd.gastos}`);
+  check('calcula utilidad en RD$', rd.balance === -10800, `= ${rd.balance}`);
+  check('ITBIS de compras deducible', rd.itbisCompras === 4500, `= ${rd.itbisCompras}`);
+  check('serie de 12 meses', rd.serie.length === 12);
   const cxc = (await req('GET', '/api/reportes/cuentas-por-cobrar')).data;
   check('cuentas por cobrar excluye pagadas', !cxc.some((x) => x.id === f1.id));
   const est = (await req('GET', '/api/reportes/estado?desde=2026-01-01&hasta=2026-12-31')).data;
-  check('estado de resultados cuadra', est.utilidad === est.totalIngresos - est.totalGastos);
+  check('estado de resultados cuadra', est.bloques.every((b) => b.utilidad === r2(b.totalIngresos - b.totalGastos)));
   const itb = (await req('GET', '/api/reportes/itbis?desde=2026-01-01&hasta=2026-12-31')).data;
   check('reporte ITBIS por mes', Array.isArray(itb) && itb.length > 0);
 
@@ -173,7 +176,7 @@ function check(nombre, cond, extra = '') {
   await req('PUT', '/api/productos/' + art.id, { ...artB, nombre: 'Funda de cemento', inventario: 1, minimo: 200, activo: 1, itbis: 1 });
   const resInv = (await req('GET', '/api/reportes/resumen')).data;
   check('el panel alerta de artículos bajo el mínimo', resInv.bajoMinimo.some((x) => x.id === art.id));
-  check('el panel calcula el valor del inventario', resInv.inventarioValor > 0, `= ${resInv.inventarioValor}`);
+  check('el panel calcula el valor del inventario', resInv.porMoneda.DOP.inventarioValor > 0, `= ${resInv.porMoneda.DOP.inventarioValor}`);
 
   console.log('\n== PDF, enlace público y WhatsApp ==');
   const pdf = await req('GET', `/api/documentos/${f1.id}/pdf`);
@@ -210,6 +213,61 @@ function check(nombre, cond, extra = '') {
   check('conserva la contraseña si se deja vacía', cor2.tiene_clave === 1);
   const sinDestino = await req('POST', `/api/documentos/${f2.id}/correo`, { para: '' });
   check('exige destinatario', sinDestino.status === 400 && /destinatario/i.test(sinDestino.data.error), JSON.stringify(sinDestino.data));
+
+  console.log('\n== Multimoneda ==');
+  const monedas = (await req('GET', '/api/monedas')).data;
+  check('ofrece RD$ y US$', monedas.length === 2 && monedas.some((m) => m.codigo === 'USD'), JSON.stringify(monedas));
+
+  const prodUsd = (await req('POST', '/api/productos', {
+    nombre: 'Bomba importada', precio: 850, costo: 620, itbis: 1, moneda: 'USD', inventario: 1, existencia: 10, minimo: 2,
+  })).data;
+  check('un artículo puede tener precio en US$', prodUsd.moneda === 'USD', prodUsd.moneda);
+  check('el artículo en RD$ conserva su moneda', (await req('GET', '/api/productos')).data.find((x) => x.id === prod.id).moneda === 'DOP');
+
+  const fUsd = (await req('POST', '/api/documentos', {
+    tipo: 'factura', contacto_id: cli.id, estado: 'emitida', moneda: 'USD', fecha: '2026-09-03',
+    items: [{ descripcion: 'Bomba importada', producto_id: prodUsd.id, cantidad: 2, precio: 850, itbis: 1 }],
+  })).data;
+  check('emite factura en US$', fUsd.moneda === 'USD', fUsd.moneda);
+  check('el ITBIS se calcula igual en US$ (18% de 1700 = 306)', fUsd.itbis === 306, `= ${fUsd.itbis}`);
+  check('total en US$', fUsd.total === 2006, `= ${fUsd.total}`);
+
+  const pagoMalo = await req('POST', '/api/ingresos', { documento_id: fUsd.id, monto: 100, moneda: 'DOP' });
+  check('rechaza cobrar en otra moneda', pagoMalo.status === 400 && /misma moneda/i.test(pagoMalo.data.error), JSON.stringify(pagoMalo.data));
+
+  const pagoUsd = (await req('POST', '/api/ingresos', { documento_id: fUsd.id, monto: 1000, metodo: 'Transferencia' })).data;
+  check('el cobro toma la moneda de la factura', pagoUsd.moneda === 'USD', pagoUsd.moneda);
+  const fUsdB = (await req('GET', '/api/documentos/' + fUsd.id)).data;
+  check('el balance en US$ es correcto', fUsdB.balance === 1006, `= ${fUsdB.balance}`);
+
+  const cambio = await req('PUT', '/api/documentos/' + fUsd.id, {
+    tipo: 'factura', contacto_id: cli.id, estado: 'emitida', moneda: 'DOP',
+    items: [{ descripcion: 'Bomba importada', cantidad: 2, precio: 850, itbis: 1 }],
+  });
+  check('no deja cambiar la moneda de una factura con cobros', cambio.status === 400 && /moneda/i.test(cambio.data.error), JSON.stringify(cambio.data));
+
+  await req('POST', '/api/ingresos', { concepto: 'Consultoría al exterior', monto: 500, moneda: 'USD', categoria: 'Servicios' });
+  await req('POST', '/api/gastos', { concepto: 'Licencia de software', categoria: 'Equipos', subtotal: 200, itbis: 36, moneda: 'USD', fecha: '2026-09-03' });
+
+  const rm = (await req('GET', '/api/reportes/resumen?desde=2026-01-01&hasta=2026-12-31')).data;
+  check('el panel separa las dos monedas', rm.monedas.includes('DOP') && rm.monedas.includes('USD'), JSON.stringify(rm.monedas));
+  check('los totales en RD$ no incluyen lo de US$', rm.porMoneda.DOP.ingresos === 18700, `= ${rm.porMoneda.DOP.ingresos}`);
+  check('los ingresos en US$ se suman aparte', rm.porMoneda.USD.ingresos === 1500, `= ${rm.porMoneda.USD.ingresos}`);
+  check('los gastos en US$ se suman aparte', rm.porMoneda.USD.gastos === 236, `= ${rm.porMoneda.USD.gastos}`);
+  check('el inventario se valora por moneda', rm.porMoneda.USD.inventarioValor === 4960, `= ${rm.porMoneda.USD.inventarioValor}`);
+
+  const inv2 = (await req('GET', '/api/inventario')).data;
+  check('el inventario reporta valor por moneda', inv2.valorPorMoneda.USD > 0 && inv2.valorPorMoneda.DOP !== undefined, JSON.stringify(inv2.valorPorMoneda));
+
+  const est2 = (await req('GET', '/api/reportes/estado?desde=2026-01-01&hasta=2026-12-31')).data;
+  check('el estado de resultados trae un bloque por moneda', est2.bloques.length === 2, `= ${est2.bloques.length}`);
+  const itb2 = (await req('GET', '/api/reportes/itbis?desde=2026-01-01&hasta=2026-12-31')).data;
+  check('el reporte de ITBIS distingue la moneda', itb2.some((x) => x.moneda === 'USD') && itb2.some((x) => x.moneda === 'DOP'));
+
+  const pdfUsd = await req('GET', `/api/documentos/${fUsd.id}/pdf`);
+  check('genera el PDF de la factura en US$', typeof pdfUsd.data === 'string' && pdfUsd.data.startsWith('%PDF-'));
+  const compUsd = (await req('GET', `/api/documentos/${fUsd.id}/compartir`)).data;
+  check('el mensaje de WhatsApp usa US$', decodeURIComponent(compUsd.whatsapp).includes('US$'), decodeURIComponent(compUsd.whatsapp).slice(0, 80));
 
   console.log('\n== Exportación y seguridad ==');
   const csv = await req('GET', '/api/export/facturas');
