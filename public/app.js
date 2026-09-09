@@ -97,7 +97,7 @@ function modal({ titulo, cuerpo, ancho, botones = [], alAbrir }) {
     pie.appendChild(el);
   });
   $$('[data-cerrar]', dlg).forEach((b) => (b.onclick = () => dlg.close()));
-  dlg.showModal();
+  if (!dlg.open) dlg.showModal();   // permite reemplazar el contenido sin cerrar
   if (alAbrir) alAbrir(dlg);
   return dlg;
 }
@@ -169,10 +169,19 @@ function irA(vista) {
   $$('aside nav a').forEach((a) => a.classList.toggle('on', a.dataset.vista === vista));
   const fn = vistas[vista] || vistas.panel;
   $('#vista').innerHTML = '<div class="tarjeta">Cargando…</div>';
-  Promise.resolve(fn()).catch((e) => {
+  Promise.resolve(fn()).then(fijarColumnaAcciones).catch((e) => {
     $('#vista').innerHTML = `<div class="tarjeta"><b>Error:</b> ${esc(e.message)}</div>`;
   });
 }
+
+/* La columna de botones se ancla a la derecha solo si la tabla no cabe;
+   si cabe entera, se deja normal para no tapar ninguna columna. */
+function fijarColumnaAcciones() {
+  $$('.tabla-scroll.con-acciones').forEach((d) => {
+    d.classList.toggle('fijar', d.scrollWidth > d.clientWidth + 2);
+  });
+}
+window.addEventListener('resize', () => setTimeout(fijarColumnaAcciones, 200));
 $$('aside nav a').forEach((a) => (a.onclick = () => irA(a.dataset.vista)));
 window.addEventListener('hashchange', () => {
   const v = location.hash.replace('#', '');
@@ -206,8 +215,8 @@ function graficoBarras(canvas, datos, opciones = {}) {
   c.font = '10px system-ui,sans-serif';
   for (let i = 0; i <= 4; i++) {
     const y = padT + gh - (gh * i) / 4;
-    c.strokeStyle = '#eef1f6'; c.beginPath(); c.moveTo(padL, y); c.lineTo(w - padR, y); c.stroke();
-    c.fillStyle = '#8a94a9'; c.textAlign = 'right';
+    c.strokeStyle = '#eceff3'; c.beginPath(); c.moveTo(padL, y); c.lineTo(w - padR, y); c.stroke();
+    c.fillStyle = '#5b6472'; c.textAlign = 'right';
     c.fillText(((tope * i) / 4).toLocaleString('es-DO', { maximumFractionDigits: 0 }), padL - 6, y + 3);
   }
   const anchoGrupo = gw / Math.max(datos.length, 1);
@@ -227,7 +236,7 @@ function graficoBarras(canvas, datos, opciones = {}) {
     });
     const salto = anchoGrupo < 38 ? 2 : 1;   // evita etiquetas encimadas
     if (i % salto === 0 || i === datos.length - 1) {
-      c.fillStyle = '#8a94a9'; c.textAlign = 'center';
+      c.fillStyle = '#5b6472'; c.textAlign = 'center';
       c.fillText(opciones.etiqueta ? opciones.etiqueta(d) : d.mes, padL + i * anchoGrupo + anchoGrupo / 2, h - 8);
     }
   });
@@ -244,8 +253,8 @@ function graficoDona(canvas, datos, opciones = {}) {
   const zona = Math.max(90, Math.min(h, w - anchoLeyenda));
   const cx = zona / 2, cy = h / 2, R = Math.min(zona, h) / 2 - 12, r = R * 0.58;
   const xLey = zona + 10;
-  const colores = ['#1f5eff', '#6d4aff', '#0f9d58', '#d98c1a', '#d93b3b', '#12a5b0', '#8a5cf6', '#7f8da5'];
-  if (!total) { c.fillStyle = '#8a94a9'; c.textAlign = 'center'; c.font = '12px system-ui'; c.fillText('Sin datos en el período', w / 2, h / 2); return; }
+  const colores = ['#192d4b', '#62d02c', '#2f5f9e', '#a3d977', '#4a6a9c', '#c47d0b', '#d33b3b', '#8892a0'];
+  if (!total) { c.fillStyle = '#5b6472'; c.textAlign = 'center'; c.font = '12px system-ui'; c.fillText('Sin datos en el período', w / 2, h / 2); return; }
   let ang = -Math.PI / 2;
   datos.forEach((d, i) => {
     const a = ((Number(d.total) || 0) / total) * Math.PI * 2;
@@ -263,7 +272,7 @@ function graficoDona(canvas, datos, opciones = {}) {
     const y = (h - alto) / 2 + 12 + i * 17;
     c.fillStyle = colores[i % colores.length];
     c.fillRect(xLey, y - 8, 9, 9);
-    c.fillStyle = '#4b5568';
+    c.fillStyle = '#0d0f12';
     const pct = Math.round(((Number(d.total) || 0) / total) * 100);
     let txt = `${d.categoria || d.nombre || '—'} · ${pct}%`;
     const maxAncho = w - xLey - 16;
@@ -291,7 +300,11 @@ function tabla({ columnas, filas, vacio = 'No hay registros', acciones }) {
   // mínimo: así caben en las medias columnas del panel y de reportes.
   const n = columnas.length + (acciones ? 1 : 0);
   const compacta = n <= 3 ? ' compacta' : (n <= 5 ? ' media' : '');
-  return `<div class="tabla-scroll${compacta}"><table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`;
+  // Con muchas columnas se reserva ancho suficiente para que el texto no se
+  // parta en varias líneas: la tarjeta se desplaza en horizontal si hace falta.
+  const ancho = n >= 6 ? ` style="min-width:${Math.max(760, n * 96)}px"` : '';
+  const clases = `tabla-scroll${compacta}${acciones ? ' con-acciones' : ''}`;
+  return `<div class="${clases}"><table${ancho}><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`;
 }
 
 const chip = (estado) => `<span class="chip ${esc(estado)}">${esc(estado)}</span>`;
@@ -394,7 +407,7 @@ vistas.panel = async function () {
     const b = document.getElementById('gBarras_' + m);
     const o = document.getElementById('gDona_' + m);
     if (b) graficoBarras(b, d.serie, {
-      series: [{ campo: 'ingresos', color: '#0f9d58' }, { campo: 'gastos', color: '#d93b3b' }],
+      series: [{ campo: 'ingresos', color: '#62d02c' }, { campo: 'gastos', color: '#d33b3b' }],
       etiqueta: (x) => mesNombre(x.mes), alto: 250,
     });
     if (o) graficoDona(o, d.gastosCat, { alto: 250 });
@@ -452,8 +465,8 @@ function vistaDocumentos(tipo) {
         filas: docs,
         vacio: `No hay ${esFactura ? 'facturas' : 'presupuestos'} con esos filtros`,
         acciones: (d) => `
-          <button class="btn-mini" onclick="verDocumento(${d.id})">Ver</button>
-          <button class="btn-mini" onclick="editarDocumento('${tipo}',${d.id})">Editar</button>
+          <button class="btn-mini" title="Ver el documento" onclick="verDocumento(${d.id})">Ver</button>
+          <button class="btn-mini" title="Editar" onclick="editarDocumento('${tipo}',${d.id})">✏️</button>
           <button class="btn-mini" title="Enviar por correo" onclick="enviarCorreo('documento',${d.id})">✉️</button>
           <button class="btn-mini" title="Enviar por WhatsApp" onclick="compartir('documento',${d.id})">💬</button>
           ${esFactura && ['emitida', 'parcial'].includes(d.estado) ? `<button class="btn-mini" onclick="cobrar(${d.id})">Cobrar</button>` : ''}
@@ -1048,6 +1061,134 @@ window.borrarGasto = async function (id) {
   toast('Gasto eliminado', 'ok'); irA('gastos');
 };
 
+/* ================================================================
+   IMPORTAR DESDE CSV
+   Dos pasos: se elige el archivo, se muestra qué se va a importar y
+   solo entonces se confirma. Nada se guarda hasta el último clic.
+   ================================================================ */
+const IMPORTABLES = {
+  proveedores: { titulo: 'proveedores', columnas: 'nombre, rnc, contacto, telefono, email, direccion, notas' },
+  clientes: { titulo: 'clientes', columnas: 'nombre, rnc, contacto, telefono, email, direccion, notas' },
+  productos: { titulo: 'artículos y servicios', columnas: 'codigo, nombre, descripcion, unidad, precio, costo, itbis, moneda, inventario, existencia, minimo' },
+};
+
+/* Excel en Windows suele guardar en ANSI: si el texto llega con caracteres
+   rotos se vuelve a leer como windows-1252 para no perder las tildes. */
+async function leerArchivoTexto(archivo) {
+  const buf = await archivo.arrayBuffer();
+  let texto = new TextDecoder('utf-8').decode(buf);
+  if (texto.includes('�')) {
+    try { texto = new TextDecoder('windows-1252').decode(buf); } catch { /* se deja el original */ }
+  }
+  return texto;
+}
+
+async function abrirImportador(tipo, alTerminar) {
+  const info = IMPORTABLES[tipo];
+  let texto = '', nombreArchivo = '';
+
+  const paso1 = () => modal({
+    titulo: `Importar ${info.titulo} desde CSV`, ancho: '640px',
+    cuerpo: `
+      <div class="zona-soltar" id="impZona">
+        <div class="icono">📄</div>
+        <p class="titulo">Arrastre aquí su archivo CSV</p>
+        <p class="ayuda">o <button type="button" class="btn-enlace" id="impElegir">búsquelo en su computadora</button></p>
+        <input type="file" id="impArchivo" accept=".csv,.txt,text/csv" hidden>
+      </div>
+      <p class="pista">Sirve cualquier archivo exportado desde Excel, Google Sheets o su sistema anterior,
+        separado por coma, punto y coma o tabulador. La primera fila debe traer los nombres de las columnas.</p>
+      <div class="nota-import">
+        <b>Columnas que se reconocen</b>
+        <div class="cols">${esc(info.columnas)}</div>
+        <div class="ayuda">Solo <b>nombre</b> es obligatorio${tipo === 'productos' ? ' (para los artículos)' : ''}.
+          Las demás pueden faltar y las columnas que no se reconozcan se ignoran.</div>
+      </div>
+      ${tipo === 'productos' ? `<div class="campos" style="margin-top:.8rem">
+        <div><label>Moneda si el archivo no la trae</label>${selectorMoneda('moneda', S.empresa?.moneda)}</div></div>` : ''}
+      <p style="margin:.9rem 0 0"><a href="${url(`/api/importar/${tipo}/plantilla`)}" class="enlace-descarga">⬇ Descargar plantilla de ejemplo</a></p>`,
+    botones: [{ texto: 'Cancelar', accion: () => {} }],
+    alAbrir: () => {
+      const zona = $('#impZona'), input = $('#impArchivo');
+      const tomar = async (archivo) => {
+        if (!archivo) return;
+        nombreArchivo = archivo.name;
+        try {
+          texto = await leerArchivoTexto(archivo);
+          await analizar();
+        } catch (e) { toast(e.message, 'error'); }
+      };
+      $('#impElegir').onclick = () => input.click();
+      zona.onclick = (ev) => { if (ev.target === zona || ev.target.closest('.icono,.titulo')) input.click(); };
+      input.onchange = () => tomar(input.files[0]);
+      ['dragenter', 'dragover'].forEach((ev) => zona.addEventListener(ev, (e) => { e.preventDefault(); zona.classList.add('activa'); }));
+      ['dragleave', 'drop'].forEach((ev) => zona.addEventListener(ev, (e) => { e.preventDefault(); zona.classList.remove('activa'); }));
+      zona.addEventListener('drop', (e) => tomar(e.dataTransfer.files[0]));
+    },
+  });
+
+  const analizar = async () => {
+    const monedaSel = $('[name=moneda]')?.value;
+    const r = await api(`/api/importar/${tipo}`, { method: 'POST', body: { texto, moneda: monedaSel } });
+    paso2(r, monedaSel);
+  };
+
+  const paso2 = (r, monedaSel) => {
+    const chipEstado = (e) => `<span class="chip ${e === 'nuevo' ? 'pagada' : e === 'duplicado' ? 'parcial' : 'vencida'}">${e}</span>`;
+    const reconocidas = r.columnas.filter((c) => c.campo);
+    const filas = r.registros.map((x) => ({
+      linea: x.linea, estado: x.estado, mensaje: x.mensaje,
+      nombre: x.datos?.nombre || '—',
+      detalle: tipo === 'productos'
+        ? [x.datos?.codigo, x.datos?.precio ? `${simbolo(x.datos.moneda)} ${n2(x.datos.precio).toLocaleString('es-DO', { minimumFractionDigits: 2 })}` : ''].filter(Boolean).join(' · ')
+        : [x.datos?.rnc, x.datos?.telefono, x.datos?.email].filter(Boolean).join(' · '),
+    }));
+    const hayDuplicados = r.resumen.duplicados > 0;
+
+    modal({
+      titulo: `Vista previa · ${esc(nombreArchivo)}`, ancho: 'min(900px,95vw)',
+      cuerpo: `
+        <div class="resumen-import">
+          <div class="dato ok"><b>${r.resumen.nuevos}</b><span>se agregarán</span></div>
+          <div class="dato aviso"><b>${r.resumen.duplicados}</b><span>ya existen</span></div>
+          <div class="dato mal"><b>${r.resumen.errores}</b><span>con problemas</span></div>
+          <div class="dato"><b>${r.resumen.total}</b><span>filas leídas</span></div>
+        </div>
+        <p class="pista">Columnas reconocidas: ${reconocidas.map((c) => `<code>${esc(c.titulo)}</code> → ${esc(c.campo)}`).join(', ') || '—'}.
+          ${r.ignoradas.length ? `Se ignoran: ${r.ignoradas.map((c) => `<code>${esc(c)}</code>`).join(', ')}.` : ''}</p>
+        ${hayDuplicados ? `<div class="campos" style="margin:.2rem 0 .6rem">
+          <div class="campo-ancho"><label>Registros que ya existen</label>
+            <select name="duplicados">
+              <option value="omitir">Omitirlos y dejar los datos actuales</option>
+              <option value="actualizar">Actualizarlos con los datos del archivo</option>
+            </select></div></div>` : ''}
+        ${tabla({
+          columnas: [
+            { t: 'Línea', num: 1, v: (f) => f.linea },
+            { t: 'Nombre', v: (f) => `<b>${esc(f.nombre)}</b>` },
+            { t: 'Datos', v: (f) => esc(f.detalle || '—') },
+            { t: 'Estado', v: (f) => chipEstado(f.estado) + (f.mensaje ? ` <span class="ayuda">${esc(f.mensaje)}</span>` : '') },
+          ], filas, vacio: 'El archivo no trae registros',
+        })}`,
+      botones: [
+        { texto: 'Elegir otro archivo', accion: () => { paso1(); return false; } },
+        { texto: hayDuplicados ? 'Importar ahora' : `Importar ${r.resumen.nuevos} registros`, clase: 'btn-primario', accion: async () => {
+          const dup = $('[name=duplicados]')?.value || 'omitir';
+          const res = await api(`/api/importar/${tipo}`, { method: 'POST', body: { texto, moneda: monedaSel, confirmar: 1, duplicados: dup } });
+          const partes = [];
+          if (res.creados) partes.push(`${res.creados} agregados`);
+          if (res.actualizados) partes.push(`${res.actualizados} actualizados`);
+          if (res.omitidos) partes.push(`${res.omitidos} omitidos`);
+          toast(partes.length ? partes.join(', ') : 'No había nada que importar', res.creados || res.actualizados ? 'ok' : '');
+          if (alTerminar) alTerminar();
+        } },
+      ],
+    });
+  };
+
+  paso1();
+}
+
 /* --------------------------------------------------------- CONTACTOS */
 function vistaContactos(tipo) {
   return async function () {
@@ -1056,7 +1197,8 @@ function vistaContactos(tipo) {
     $('#vista').innerHTML = `
       <div class="encabezado">
         <div><h1>${esCliente ? 'Clientes' : 'Proveedores'}</h1><div class="sub">${rows.length} registrados</div></div>
-        <div style="display:flex;gap:.5rem">
+        <div class="acciones-encabezado">
+          <button id="btnImportar">⬆ Importar CSV</button>
           <button id="btnExport">⬇ Exportar CSV</button>
           <button class="btn-primario" id="btnNuevo">+ Nuevo ${esCliente ? 'cliente' : 'proveedor'}</button>
         </div>
@@ -1074,8 +1216,10 @@ function vistaContactos(tipo) {
           <button class="btn-mini" onclick="editarContacto('${tipo}',${c.id})">Editar</button>
           <button class="btn-mini btn-peligro" onclick="borrarContacto(${c.id},'${tipo}')">✕</button>`,
       })}</div>`;
+    const area = esCliente ? 'clientes' : 'proveedores';
     $('#btnNuevo').onclick = () => editarContacto(tipo, null);
-    $('#btnExport').onclick = () => (location.href = url(`/api/export/${esCliente ? 'clientes' : 'proveedores'}`));
+    $('#btnExport').onclick = () => (location.href = url(`/api/export/${area}`));
+    $('#btnImportar').onclick = () => abrirImportador(area, () => { cerrarModal(); irA(area); });
   };
 }
 vistas.clientes = vistaContactos('cliente');
@@ -1146,7 +1290,10 @@ vistas.productos = async function () {
   $('#vista').innerHTML = `
     <div class="encabezado">
       <div><h1>Productos y servicios</h1><div class="sub">${rows.length} artículos en el catálogo</div></div>
-      <button class="btn-primario" id="btnNuevo">+ Nuevo artículo</button>
+      <div class="acciones-encabezado">
+        <button id="btnImportar">⬆ Importar CSV</button>
+        <button class="btn-primario" id="btnNuevo">+ Nuevo artículo</button>
+      </div>
     </div>
     <div class="tarjeta">${tabla({
       columnas: [
@@ -1168,6 +1315,7 @@ vistas.productos = async function () {
         <button class="btn-mini btn-peligro" onclick="borrarProducto(${p.id})">✕</button>`,
     })}</div>`;
   $('#btnNuevo').onclick = () => editarProducto(null);
+  $('#btnImportar').onclick = () => abrirImportador('productos', () => { cerrarModal(); irA('productos'); });
 };
 
 window.editarProducto = async function (id) {

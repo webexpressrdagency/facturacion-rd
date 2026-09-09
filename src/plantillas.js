@@ -2,10 +2,12 @@
 /* Plantillas de impresión en PDF: factura, presupuesto y recibo. */
 const { Pagina, construirPDF, leerJPEG, medir, envolver } = require('./pdf');
 
-const AZUL = '#1f5eff';
-const OSC = '#12203f';
-const GRIS = '#f2f5fa';
-const SUAVE = '#6b7793';
+/* Colores de la marca: azul marino y verde del logo. */
+const AZUL = '#192d4b';       // encabezados y títulos
+const VERDE = '#62d02c';      // línea de acento
+const OSC = '#101f36';        // fondo de las cabeceras de tabla
+const GRIS = '#f4f6f8';
+const SUAVE = '#5b6472';
 const M = 46;                 // margen
 const ANCHO_UTIL = 612 - M * 2;
 
@@ -47,7 +49,7 @@ function cabecera(pag, e, titulo, derecha, imagenes) {
   });
 
   const yLinea = Math.max(y + 4, yd + 6);
-  pag.linea(M, yLinea, 612 - M, yLinea, AZUL, 2);
+  pag.linea(M, yLinea, 612 - M, yLinea, VERDE, 2.4);
   return yLinea + 16;
 }
 

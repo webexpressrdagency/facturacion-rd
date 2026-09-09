@@ -4,6 +4,7 @@ const { db, hashPassword, verifyPassword, siguienteNumero, siguienteNCF, nuevoTo
   MONEDAS, monedaValida, simboloDe } = require('./db');
 const { pdfDocumento, pdfRecibo } = require('./plantillas');
 const correo = require('./correo');
+const importador = require('./importar');
 
 // ------------------------------------------------------------------ sesiones
 /* La sesión viaja firmada dentro de la propia cookie (HMAC-SHA256). Así sigue
@@ -388,6 +389,86 @@ on('DELETE', '/api/contactos/:id', (c) => {
   db.prepare('DELETE FROM contactos WHERE id = ?').run(id);
   return { body: { ok: true } };
 });
+
+// ---- importación de listados en CSV
+/* Dos pasos: primero se analiza el archivo y se devuelve la vista previa
+   (confirmar = 0), y solo si el usuario acepta se escribe (confirmar = 1).
+   El análisis se rehace del lado del servidor al confirmar, para no fiarse
+   de lo que devuelva el navegador. */
+on('GET', '/api/importar/:tipo/plantilla', (c) => {
+  const csvTexto = importador.plantilla(c.params.tipo);
+  if (!csvTexto) return { status: 404, body: { error: 'Plantilla no disponible' } };
+  return { status: 200, raw: csvTexto, contentType: 'text/csv; charset=utf-8', filename: `plantilla-${c.params.tipo}.csv` };
+});
+
+on('POST', '/api/importar/:tipo', (c) => {
+  const tipo = c.params.tipo;
+  if (!importador.tiposValidos().includes(tipo)) return { status: 404, body: { error: 'Tipo de importación no válido' } };
+  const analisis = importador.analizar(tipo, txt(c.body.texto), { moneda: c.body.moneda });
+  if (analisis.error) return { status: 400, body: analisis };
+  if (!c.body.confirmar) return { body: { ...analisis, registros: analisis.registros.slice(0, 300) } };
+
+  const actualizar = txt(c.body.duplicados) === 'actualizar';
+  let creados = 0, actualizados = 0, omitidos = 0;
+  // Todo o nada: si algo falla a mitad no queda media lista importada.
+  db.exec('BEGIN');
+  try {
+    for (const r of analisis.registros) {
+      if (r.estado === 'error') { omitidos++; continue; }
+      if (r.estado === 'duplicado' && !actualizar) { omitidos++; continue; }
+      if (tipo === 'productos') {
+        if (r.estado === 'duplicado') { actualizarProductoImportado(r.id, r.datos); actualizados++; }
+        else { crearProductoImportado(r.datos); creados++; }
+      } else if (r.estado === 'duplicado') { actualizarContactoImportado(r.id, r.datos); actualizados++; }
+      else {
+        db.prepare(`INSERT INTO contactos (tipo,nombre,rnc,contacto,telefono,email,direccion,notas,activo)
+          VALUES (?,?,?,?,?,?,?,?,1)`).run(r.datos.tipo, r.datos.nombre, r.datos.rnc, r.datos.contacto,
+          r.datos.telefono, r.datos.email, r.datos.direccion, r.datos.notas);
+        creados++;
+      }
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    return { status: 400, body: { error: `No se pudo importar: ${err.message}` } };
+  }
+  return { body: { ok: true, tipo, titulo: analisis.titulo, creados, actualizados, omitidos, resumen: analisis.resumen } };
+});
+
+/* Al actualizar un duplicado solo se pisan las celdas que traen contenido:
+   así un archivo parcial no borra los datos que ya estaban cargados. */
+function actualizarContactoImportado(id, d) {
+  const prev = db.prepare('SELECT * FROM contactos WHERE id = ?').get(id);
+  if (!prev) return;
+  const v = (campo) => (d[campo] ? d[campo] : prev[campo]);
+  db.prepare(`UPDATE contactos SET nombre=?, rnc=?, contacto=?, telefono=?, email=?, direccion=?, notas=?, activo=1 WHERE id=?`)
+    .run(v('nombre'), v('rnc'), v('contacto'), v('telefono'), v('email'), v('direccion'), v('notas'), id);
+}
+
+function crearProductoImportado(d) {
+  const info = db.prepare(`INSERT INTO productos (codigo,nombre,descripcion,unidad,precio,costo,itbis,activo,inventario,existencia,minimo,moneda)
+    VALUES (?,?,?,?,?,?,?,1,?,0,?,?)`).run(d.codigo, d.nombre, d.descripcion, d.unidad, d.precio, d.costo,
+    d.itbis, d.inventario, d.minimo, d.moneda);
+  const id = Number(info.lastInsertRowid);
+  if (d.inventario && d.existencia !== 0) {
+    registrarMovimiento({ producto_id: id, tipo: 'entrada', cantidad: d.existencia, costo: d.costo, motivo: 'Existencia inicial (importación)' });
+  }
+  return id;
+}
+
+function actualizarProductoImportado(id, d) {
+  const prev = db.prepare('SELECT * FROM productos WHERE id = ?').get(id);
+  if (!prev) return;
+  db.prepare(`UPDATE productos SET codigo=?, nombre=?, descripcion=?, unidad=?, precio=?, costo=?, itbis=?,
+    inventario=?, minimo=?, moneda=?, activo=1 WHERE id=?`).run(
+    d.codigo || prev.codigo, d.nombre, d.descripcion || prev.descripcion, d.unidad || prev.unidad,
+    d.precio || prev.precio, d.costo || prev.costo, d.itbis, d.inventario, d.minimo || prev.minimo, d.moneda, id);
+  // La existencia no se sobrescribe: se ajusta con un movimiento, para no perder el historial.
+  if (d.inventario && d.existencia !== 0 && d.existencia !== prev.existencia) {
+    registrarMovimiento({ producto_id: id, tipo: 'ajuste', cantidad: d.existencia, costo: d.costo || prev.costo,
+      motivo: 'Ajuste por importación' });
+  }
+}
 
 // ---- productos
 on('GET', '/api/productos', (c) => {

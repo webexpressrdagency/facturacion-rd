@@ -269,6 +269,65 @@ function check(nombre, cond, extra = '') {
   const compUsd = (await req('GET', `/api/documentos/${fUsd.id}/compartir`)).data;
   check('el mensaje de WhatsApp usa US$', decodeURIComponent(compUsd.whatsapp).includes('US$'), decodeURIComponent(compUsd.whatsapp).slice(0, 80));
 
+  console.log('\n== Importación CSV ==');
+  // Archivo "difícil" a propósito: separador de punto y coma, tildes en los
+  // encabezados, alias distintos, una comilla suelta, un duplicado y una fila mala.
+  const csvProv = [
+    'Nombre;RNC / Cédula;Persona de contacto;Teléfono;Correo electrónico;Dirección',
+    'Ferretería Nacional SRL;131-55555-1;Marcos Ureña;809-555-1010;ventas@ferrenacional.do;Av. 27 de Febrero 320',
+    'Aceros del Cibao SA;131-66666-2;Yolanda Cruz;829-444-2020;compras@acerocibao.do;Santiago',
+    ';131-77777-3;Sin nombre;809-000-0000;x@y.do;',
+  ].join('\r\n');
+
+  const previa = await req('POST', '/api/importar/proveedores', { texto: csvProv });
+  check('la vista previa no guarda nada todavía', previa.status === 200 && previa.data.resumen.total === 3, JSON.stringify(previa.data.resumen));
+  check('reconoce los encabezados con tildes y alias', previa.data.columnas.filter((c) => c.campo).length === 6);
+  check('detecta el punto y coma como separador', previa.data.separador === ';', `= ${previa.data.separador}`);
+  check('marca como error la fila sin nombre', previa.data.resumen.errores === 1 && previa.data.resumen.nuevos === 2);
+  const antesProv = (await req('GET', '/api/contactos?tipo=proveedor')).data.length;
+
+  const impProv = await req('POST', '/api/importar/proveedores', { texto: csvProv, confirmar: 1 });
+  check('importa los proveedores válidos', impProv.data.creados === 2 && impProv.data.omitidos === 1, JSON.stringify(impProv.data));
+  const provs = (await req('GET', '/api/contactos?tipo=proveedor')).data;
+  check('los proveedores quedan guardados', provs.length === antesProv + 2);
+  const ferre = provs.find((p) => p.nombre === 'Ferretería Nacional SRL');
+  check('conserva tildes y datos de contacto', !!ferre && ferre.telefono === '809-555-1010' && ferre.rnc === '131-55555-1');
+
+  const repetido = await req('POST', '/api/importar/proveedores', { texto: csvProv, confirmar: 1 });
+  check('no duplica al volver a importar el mismo archivo', repetido.data.creados === 0 && repetido.data.omitidos === 3, JSON.stringify(repetido.data));
+
+  const csvProv2 = 'nombre;rnc;telefono\nFerretería Nacional SRL;131-55555-1;809-555-2222';
+  const actual = await req('POST', '/api/importar/proveedores', { texto: csvProv2, confirmar: 1, duplicados: 'actualizar' });
+  check('puede actualizar los que ya existen', actual.data.actualizados === 1, JSON.stringify(actual.data));
+  const ferre2 = (await req('GET', '/api/contactos?tipo=proveedor')).data.find((p) => p.rnc === '131-55555-1');
+  check('el archivo parcial no borra los datos anteriores', ferre2.telefono === '809-555-2222' && ferre2.email === 'ventas@ferrenacional.do');
+
+  const csvProd = [
+    'codigo,articulo,precio de venta,costo,itbis,moneda,inventario,existencia,minimo',
+    'PIN-01,Galón de pintura acrílica,"1,450.00","980.00",si,RD$,si,40,10',
+    'TUB-34,Tubo PVC 3/4" x 20 pies,285.50,190,SI,pesos,sí,120,30',
+    'IMP-02,Grifería importada,215.00,150.00,si,USD,si,18,5',
+    'SRV-05,Dirección facultativa,"35,000.00",0,si,,no,,',
+  ].join('\n');
+  const impProd = await req('POST', '/api/importar/productos', { texto: csvProd, confirmar: 1 });
+  check('importa el catálogo', impProd.data.creados === 4, JSON.stringify(impProd.data));
+  const cat = (await req('GET', '/api/productos')).data;
+  const pintura = cat.find((p) => p.codigo === 'PIN-01');
+  const tubo = cat.find((p) => p.codigo === 'TUB-34');
+  const griferia = cat.find((p) => p.codigo === 'IMP-02');
+  const servicioImp = cat.find((p) => p.codigo === 'SRV-05');
+  check('lee los miles escritos con coma', pintura && pintura.precio === 1450, `= ${pintura && pintura.precio}`);
+  check('respeta las comillas dentro del texto', tubo && tubo.nombre === 'Tubo PVC 3/4" x 20 pies', tubo && tubo.nombre);
+  check('reconoce la moneda escrita de varias formas', griferia.moneda === 'USD' && tubo.moneda === 'DOP' && pintura.moneda === 'DOP');
+  check('el artículo sin inventario no lleva existencia', servicioImp.inventario === 0 && servicioImp.existencia === 0);
+  check('carga la existencia inicial', pintura.existencia === 40 && griferia.existencia === 18);
+
+  const plant = await req('GET', '/api/importar/proveedores/plantilla');
+  check('ofrece una plantilla de ejemplo', typeof plant.data === 'string' && plant.data.includes('nombre'));
+  check('rechaza un tipo de importación desconocido', (await req('POST', '/api/importar/facturas', { texto: 'a,b' })).status === 404);
+  check('avisa si falta la columna del nombre', (await req('POST', '/api/importar/clientes', { texto: 'telefono\n809' })).status === 400);
+  check('avisa si el archivo viene vacío', (await req('POST', '/api/importar/clientes', { texto: '' })).status === 400);
+
   console.log('\n== Exportación y seguridad ==');
   const csv = await req('GET', '/api/export/facturas');
   check('exporta CSV de facturas', typeof csv.data === 'string' && csv.data.includes('numero'));
