@@ -36,6 +36,15 @@ const BASE = (() => {
 })();
 const url = (r) => BASE + r;
 
+// El logo se resuelve con la misma base, para que funcione también en subcarpetas
+(() => {
+  const img = document.getElementById('logoAcceso');
+  if (!img) return;
+  img.onload = () => { img.hidden = false; };
+  img.onerror = () => { img.remove(); };
+  img.src = url('/logo.png');
+})();
+
 async function api(ruta, opts = {}) {
   const res = await fetch(url(ruta), {
     method: opts.method || 'GET',

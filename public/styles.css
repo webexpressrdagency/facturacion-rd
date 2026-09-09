@@ -13,8 +13,8 @@ h1{font-size:1.35rem}h2{font-size:1.1rem}h3{font-size:.95rem}
 /* ---------- login ---------- */
 #login{position:fixed;inset:0;display:grid;place-items:center;background:linear-gradient(140deg,#12203f,#1f5eff);z-index:50}
 #login .caja{background:#fff;padding:2rem;border-radius:14px;width:min(380px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.3)}
-#login .marca{font-size:1.3rem;font-weight:700;margin-bottom:.25rem}
-#login p{color:var(--suave);margin:0 0 1.2rem}
+#login .marca{display:block;width:100%;max-width:260px;height:auto;margin:0 auto .9rem}
+#login p{color:var(--suave);margin:0 0 1.2rem;text-align:center}
 
 /* ---------- layout ---------- */
 #app{display:none;grid-template-columns:230px 1fr;min-height:100vh}
